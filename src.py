@@ -254,18 +254,44 @@ def generate_qp(
 def generate_dqp(nx: int, neq: int, nineq: int, seed: int) -> QPData:
     np.random.seed(seed)
     
-    # Generate a positive semidefinite perturbation matrix dQ = M @ M.T
-    # We scale by (1 / nx) so the spectral norm of dQ remains around O(1)
+    # 1. Generate dQ (Positive Semidefinite) and normalize
     M = np.random.randn(nx, nx)
-    dQ = (M @ M.T) / nx
+    dQ = M @ M.T
+    dQ = dQ / np.linalg.norm(dQ, ord='fro')
+    
+    # 2. Generate dq and normalize (L2 norm)
+    dq = np.random.randn(nx, 1)
+    dq = dq / np.linalg.norm(dq)
+    
+    # 3. Generate dA and db, handle empty cases
+    if neq > 0:
+        dA = np.random.randn(neq, nx)
+        dA = dA / np.linalg.norm(dA, ord='fro')
+        
+        db = np.random.randn(neq, 1)
+        db = db / np.linalg.norm(db)
+    else:
+        dA = np.empty((0, nx))
+        db = np.empty((0, 1))
+        
+    # 4. Generate dG and dh, handle empty cases
+    if nineq > 0:
+        dG = np.random.randn(nineq, nx)
+        dG = dG / np.linalg.norm(dG, ord='fro')
+        
+        dh = np.random.randn(nineq, 1)
+        dh = dh / np.linalg.norm(dh)
+    else:
+        dG = np.empty((0, nx))
+        dh = np.empty((0, 1))
     
     return QPData(
         Q=ca.DM(dQ), 
-        q=ca.DM(np.random.randn(nx, 1)),
-        A=ca.DM(np.random.randn(neq, nx)), 
-        b=ca.DM(np.random.randn(neq, 1)),
-        G=ca.DM(np.random.randn(nineq, nx)), 
-        h=ca.DM(np.random.randn(nineq, 1))
+        q=ca.DM(dq),
+        A=ca.DM(dA), 
+        b=ca.DM(db),
+        G=ca.DM(dG), 
+        h=ca.DM(dh)
     )
 
 def perturb_qp(qp: QPData, dqp: QPData, eps: float) -> QPData:

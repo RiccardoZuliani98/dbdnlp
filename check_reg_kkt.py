@@ -16,8 +16,8 @@ SCS = False
 SOSC = False
 
 # Hyperparameters
-RHO = 5e-1  # Regularization parameter
-EPS_VALS = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]  # Perturbation magnitudes
+RHO = 1  # Regularization parameter
+EPS_VALS = [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]  # Perturbation magnitudes
 
 # Data storage for the summary table
 results = {
