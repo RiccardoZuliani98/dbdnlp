@@ -15,7 +15,7 @@ DIMENSIONS = [
 ]
 
 BOOLEANS = [True, False]
-RHO = 1e-4
+RHO = 1e-1
 TOLERANCE = 1e-6
 
 # =====================================================================
@@ -42,7 +42,8 @@ def test_regularized_qp_restores_properties(nx, neq, nineq, licq, sosc):
     qp_reg = regularize_qp(qp, true_sol, RHO)
     
     # 3. Solve the regularized QP
-    opts = {'printLevel': 'none'}
+    # opts = {'printLevel': 'none'}
+    opts = {"solver":"clarabel"}
     solver_reg = QPSolver(qp_reg, options=opts)
     sol_reg = solver_reg.solve()
     

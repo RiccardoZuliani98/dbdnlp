@@ -2,6 +2,7 @@ import casadi as ca
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Optional
+import cvxpy as cp
 
 @dataclass
 class QPData:
@@ -350,78 +351,182 @@ def regularize_qp(qp: QPData, sol: QPSolution, rho: float) -> QPData:
         G=G_new, h=h_new
     )
 
+# class QPSolver:
+#     def __init__(self, qp_data: QPData, options: Optional[dict] = None, tol : Optional[float] = None):
+#         if options is None:
+#             options = {}
+            
+#         # Extract the solver plugin (defaulting to qpoases if not provided)
+#         # CasADi needs this to know which underlying C++ solver to invoke.
+#         plugin = options.pop('plugin', 'qpoases')
+        
+#         self.default_qp = qp_data
+#         self.nx = qp_data.Q.shape[0]
+#         self.neq = qp_data.A.shape[0]
+#         self.nineq = qp_data.G.shape[0]
+        
+#         # Define the structural sparsity for the solver.
+#         # We stack A (neq rows) and G (nineq rows) into a single matrix.
+#         h_sp = ca.Sparsity.dense(self.nx, self.nx)
+#         a_sp = ca.Sparsity.dense(self.neq + self.nineq, self.nx)
+        
+#         # Initialize the CasADi solver object by passing the sparsity patterns.
+#         self.solver = ca.conic('qp_solver', plugin, {'h': h_sp, 'a': a_sp}, options)
+
+#         # Tolerance when checking for LICQ violations
+#         self.tol = tol if tol is not None else 1e-5
+
+#     def solve(self, qp: Optional[QPData] = None, warmstart: Optional[QPSolution] = None) -> QPSolution:
+#         if qp is None:
+#             qp = self.default_qp
+            
+#         # Ensure dimensions haven't changed, as the solver object's sparsity is already compiled
+#         assert qp.Q.shape[0] == self.nx, "Updated QP nx must match original."
+#         assert qp.A.shape[0] == self.neq, "Updated QP neq must match original."
+#         assert qp.G.shape[0] == self.nineq, "Updated QP nineq must match original."
+        
+#         # Stack matrices to match CasADi's standard form: lba <= a*x <= uba
+#         a_val = ca.vertcat(qp.A, qp.G)
+        
+#         # Equalities: Ax = b   =>   lba = b, uba = b
+#         # Inequalities: Gx <= h  =>   lba = -inf, uba = h
+#         lba = ca.vertcat(qp.b, ca.DM.ones(self.nineq, 1) * -ca.inf) # type:ignore
+#         uba = ca.vertcat(qp.b, qp.h)
+        
+#         # Prepare inputs
+#         solver_in = {
+#             'h': qp.Q,
+#             'g': qp.q,
+#             'a': a_val,
+#             'lba': lba,
+#             'uba': uba
+#         }
+        
+#         # Inject warmstart if provided
+#         if warmstart is not None:
+#             solver_in['x0'] = warmstart.x
+#             # Stack the dual variables (multipliers) the same way we stacked 'a'
+#             solver_in['lam_a0'] = ca.vertcat(warmstart.mu, warmstart.lam)
+            
+#         # Solve the QP
+#         res = self.solver(**solver_in)
+        
+#         # Extract primal solution
+#         x_opt = res['x']
+        
+#         # Extract and slice dual solutions
+#         lam_a_opt = res['lam_a']
+#         mu_opt = lam_a_opt[:self.neq]
+#         lam_opt = lam_a_opt[self.neq:]
+        
+#         # form residual
+#         residual = evaluate_kkt(qp, x_opt, lam_opt, mu_opt)
+
+#         # get properties
+#         properties = check_properties(qp, x_opt, lam_opt, self.tol)
+        
+#         return QPSolution(
+#             x=x_opt,
+#             mu=mu_opt,
+#             lam=lam_opt,
+#             residual=residual,
+#             properties=properties
+#         )
+
 class QPSolver:
-    def __init__(self, qp_data: QPData, options: Optional[dict] = None, tol : Optional[float] = None):
+    def __init__(self, qp_data, options: Optional[dict] = None, tol: Optional[float] = None):
         if options is None:
             options = {}
             
-        # Extract the solver plugin (defaulting to qpoases if not provided)
-        # CasADi needs this to know which underlying C++ solver to invoke.
-        plugin = options.pop('plugin', 'qpoases')
-        
         self.default_qp = qp_data
         self.nx = qp_data.Q.shape[0]
         self.neq = qp_data.A.shape[0]
         self.nineq = qp_data.G.shape[0]
         
-        # Define the structural sparsity for the solver.
-        # We stack A (neq rows) and G (nineq rows) into a single matrix.
-        h_sp = ca.Sparsity.dense(self.nx, self.nx)
-        a_sp = ca.Sparsity.dense(self.neq + self.nineq, self.nx)
-        
-        # Initialize the CasADi solver object by passing the sparsity patterns.
-        self.solver = ca.conic('qp_solver', plugin, {'h': h_sp, 'a': a_sp}, options)
-
-        # Tolerance when checking for LICQ violations
+        # Store solver options for CVXPY (e.g., {'solver': cp.OSQP})
+        self.options = options
         self.tol = tol if tol is not None else 1e-5
 
-    def solve(self, qp: Optional[QPData] = None, warmstart: Optional[QPSolution] = None) -> QPSolution:
+    def solve(self, qp = None, warmstart = None):
         if qp is None:
             qp = self.default_qp
             
-        # Ensure dimensions haven't changed, as the solver object's sparsity is already compiled
+        # Ensure dimensions haven't changed
         assert qp.Q.shape[0] == self.nx, "Updated QP nx must match original."
         assert qp.A.shape[0] == self.neq, "Updated QP neq must match original."
         assert qp.G.shape[0] == self.nineq, "Updated QP nineq must match original."
         
-        # Stack matrices to match CasADi's standard form: lba <= a*x <= uba
-        a_val = ca.vertcat(qp.A, qp.G)
+        # 1. Convert CasADi matrices to NumPy arrays for CVXPY
+        # Use .flatten() on vectors to ensure they are 1D arrays
+        Q_np = np.array(qp.Q)
+        q_np = np.array(qp.q).flatten()
         
-        # Equalities: Ax = b   =>   lba = b, uba = b
-        # Inequalities: Gx <= h  =>   lba = -inf, uba = h
-        lba = ca.vertcat(qp.b, ca.DM.ones(self.nineq, 1) * -ca.inf) # type:ignore
-        uba = ca.vertcat(qp.b, qp.h)
+        A_np = np.array(qp.A) if self.neq > 0 else None
+        b_np = np.array(qp.b).flatten() if self.neq > 0 else None
         
-        # Prepare inputs
-        solver_in = {
-            'h': qp.Q,
-            'g': qp.q,
-            'a': a_val,
-            'lba': lba,
-            'uba': uba
-        }
+        G_np = np.array(qp.G) if self.nineq > 0 else None
+        h_np = np.array(qp.h).flatten() if self.nineq > 0 else None
+
+        # 2. Define CVXPY Problem
+        x = cp.Variable(self.nx)
         
-        # Inject warmstart if provided
-        if warmstart is not None:
-            solver_in['x0'] = warmstart.x
-            # Stack the dual variables (multipliers) the same way we stacked 'a'
-            solver_in['lam_a0'] = ca.vertcat(warmstart.mu, warmstart.lam)
+        # Ensure Q is symmetric for CVXPY (sometimes numerical noise prevents strict symmetry)
+        Q_sym = (Q_np + Q_np.T) / 2.0
+        objective = cp.Minimize(0.5 * cp.quad_form(x, Q_sym) + q_np.T @ x)
+        
+        constraints = []
+        eq_idx = -1
+        ineq_idx = -1
+        
+        if self.neq > 0:
+            eq_constr = (A_np @ x == b_np)
+            constraints.append(eq_constr)
+            eq_idx = len(constraints) - 1
             
-        # Solve the QP
-        res = self.solver(**solver_in)
+        if self.nineq > 0:
+            ineq_constr = (G_np @ x <= h_np)
+            constraints.append(ineq_constr)
+            ineq_idx = len(constraints) - 1
+            
+        prob = cp.Problem(objective, constraints)
         
-        # Extract primal solution
-        x_opt = res['x']
+        # 3. Apply Warmstart if provided
+        if warmstart is not None:
+            x.value = np.array(warmstart.x).flatten()
+            # if self.neq > 0 and warmstart.mu is not None:
+            #     constraints[eq_idx].dual_value = np.array(warmstart.mu).flatten()
+            # if self.nineq > 0 and warmstart.lam is not None:
+            #     constraints[ineq_idx].dual_value = np.array(warmstart.lam).flatten()
+                
+        # 4. Solve the QP
+        # warm_start flag must be passed to .solve() to utilize the injected .value attributes
+        prob.solve(warm_start=(warmstart is not None), **self.options)
         
-        # Extract and slice dual solutions
-        lam_a_opt = res['lam_a']
-        mu_opt = lam_a_opt[:self.neq]
-        lam_opt = lam_a_opt[self.neq:]
+        if x.value is None:
+            raise RuntimeError(f"CVXPY failed to solve the QP. Solver status: {prob.status}")
+
+        # 5. Extract solutions and convert back to CasADi DM types
+        x_opt = ca.DM(x.value)
         
-        # form residual
+        # Extract duals (default to empty CasADi vectors if no constraints exist)
+        if self.neq > 0 and constraints[eq_idx].dual_value is not None:
+            mu_opt = ca.DM(constraints[eq_idx].dual_value)
+        else:
+            mu_opt = ca.DM(np.zeros(0))
+            
+        if self.nineq > 0 and constraints[ineq_idx].dual_value is not None:
+            lam_opt = ca.DM(constraints[ineq_idx].dual_value)
+        else:
+            lam_opt = ca.DM(np.zeros(0))
+            
+        # Note: Depending on the backend solver CVXPY chooses, the sign convention 
+        # of the equality dual variables (`mu_opt`) might be inverted compared to CasADi's `qpoases`.
+        # If evaluate_kkt fails, you may need to flip the sign: mu_opt = -ca.DM(...)
+
+        # Form residual
         residual = evaluate_kkt(qp, x_opt, lam_opt, mu_opt)
 
-        # get properties
+        # Get properties
         properties = check_properties(qp, x_opt, lam_opt, self.tol)
         
         return QPSolution(
@@ -516,6 +621,91 @@ class QPSolver:
         dmu = d_sol[self.nx : self.nx + self.neq]
         dlam = d_sol[self.nx + self.neq :]
         
+        return QPSolution(
+            x=dx, 
+            mu=dmu, 
+            lam=dlam, 
+            residual={}, 
+            properties=system_properties
+        )
+    
+    def differentiate_alt(self, sol: QPSolution, dqp: QPData, qp: Optional[QPData] = None, lstsq: bool = False) -> QPSolution:
+        """
+        Differentiates through the KKT conditions using the Implicit Function Theorem (IFT) 
+        on the active set, yielding a symmetric linear system.
+        """
+        import numpy as np
+        
+        if qp is None:
+            qp = self.default_qp
+            
+        # 1. Identify active constraints to form the reduced symmetric system
+        tol = getattr(self, 'tol', 1e-5)
+        ineq_eval = np.array((ca.mtimes(qp.G, sol.x) - qp.h).full()).flatten()
+        act_idx = np.where(np.abs(ineq_eval) <= tol)[0].tolist()
+        n_act = len(act_idx)
+        
+        # 2. Build the symmetric KKT Jacobian (J_sym)
+        G_act = qp.G[act_idx, :] if n_act > 0 else ca.DM(0, self.nx)
+        
+        # Block Row 1: Stationarity -> [Q, A^T, G_act^T]
+        row1 = ca.horzcat(qp.Q, qp.A.T, G_act.T)
+        
+        # Block Row 2: Equality -> [A, 0, 0]
+        row2 = ca.horzcat(qp.A, ca.DM.zeros(self.neq, self.neq), ca.DM.zeros(self.neq, n_act))
+        
+        # Block Row 3: Active Inequality Slackness -> [G_act, 0, 0]
+        row3 = ca.horzcat(G_act, ca.DM.zeros(n_act, self.neq), ca.DM.zeros(n_act, n_act))
+        
+        J_sym = ca.vertcat(row1, row2, row3)
+        
+        # 3. Build the right-hand side
+        d_stationarity = ca.mtimes(dqp.Q, sol.x) + dqp.q + \
+                         ca.mtimes(dqp.A.T, sol.mu) + ca.mtimes(dqp.G.T, sol.lam)
+                         
+        d_equality = ca.mtimes(dqp.A, sol.x) - dqp.b
+        
+        if n_act > 0:
+            dG_act = dqp.G[act_idx, :]
+            dh_act = dqp.h[act_idx, :]
+            d_act = ca.mtimes(dG_act, sol.x) - dh_act
+        else:
+            d_act = ca.DM(0, 1) # type: ignore
+            
+        rhs = -ca.vertcat(d_stationarity, d_equality, d_act)
+        
+        # 4. Analyze the linear system for uniqueness
+        J_np = np.array(J_sym.full())
+        rhs_np = np.array(rhs.full())
+        
+        n_vars = self.nx + self.neq + n_act
+        rank_tol = 1e-8
+        
+        rank_J = np.linalg.matrix_rank(J_np, tol=rank_tol)
+        rank_aug = np.linalg.matrix_rank(np.hstack([J_np, rhs_np]), tol=rank_tol)
+        
+        system_properties = {
+            'unique_solution': bool(rank_J == n_vars),
+            'infinite_solutions': bool((rank_J == rank_aug) and (rank_J < n_vars)),
+            'no_solution': bool(rank_J < rank_aug),
+            'rank_J': int(rank_J),
+            'expected_rank': int(n_vars)
+        }
+        
+        # 5. Solve the symmetric linear system
+        if lstsq:
+            d_sol_act = ca.DM(np.linalg.lstsq(J_np, rhs_np, rcond=None)[0])
+        else:
+            d_sol_act = ca.solve(J_sym, rhs, "csparse")
+        
+        # 6. Unpack differentials and map active multipliers back to full dual dimension
+        dx = d_sol_act[:self.nx]
+        dmu = d_sol_act[self.nx : self.nx + self.neq]
+        
+        dlam = ca.DM.zeros(self.nineq, 1)
+        if n_act > 0:
+            dlam[act_idx, 0] = d_sol_act[self.nx + self.neq :]
+            
         return QPSolution(
             x=dx, 
             mu=dmu, 

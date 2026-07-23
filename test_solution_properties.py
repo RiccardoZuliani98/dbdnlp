@@ -42,7 +42,8 @@ def test_qp_solver_properties_and_kkt(nx, neq, nineq, licq, sosc):
     )
     
     # 2. Initialize the solver and solve with warmstart
-    opts = {'printLevel': 'none'}
+    # opts = {'printLevel': 'none'}
+    opts = {"solver":"clarabel"}
     solver = QPSolver(qp, options=opts)
     
     sol = solver.solve(warmstart=true_sol)

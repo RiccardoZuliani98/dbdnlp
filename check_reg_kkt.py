@@ -1,10 +1,10 @@
 import casadi as ca
-from src import QPSolver, generate_qp, generate_dqp, perturb_qp, regularize_qp, evaluate_kkt
+from src import QPSolver, generate_qp, generate_dqp, perturb_qp, regularize_qp, evaluate_kkt, QPSolution
 
 # =====================================================================
 # CONFIGURATION CONSTANTS
 # =====================================================================
-N_QPS = 5
+N_QPS = 25
 NX = 20
 NEQ = 5
 NINEQ = 5
@@ -16,8 +16,8 @@ SCS = False
 SOSC = False
 
 # Hyperparameters
-RHO = 5  # Regularization parameter
-EPS_VALS = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6]  # Perturbation magnitudes
+RHO = 5e-1  # Regularization parameter
+EPS_VALS = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]  # Perturbation magnitudes
 
 # Data storage for the summary table
 results = {
@@ -29,7 +29,8 @@ for eps in EPS_VALS:
     results[f"Approx KKT (e={eps:.0e})"] = []
 
 # Supress solver printing for clean output
-opts = {'printLevel': 'none'}
+# opts = {'printLevel': 'none'}
+opts = {"solver":"clarabel"}
 
 for i in range(N_QPS):
     # ==========================================
@@ -47,7 +48,27 @@ for i in range(N_QPS):
     # 2. REGULARIZED QP: Solve and Differentiate
     # ==========================================
     solver_reg = QPSolver(qp_reg, options=opts)
-    sol_reg = solver_reg.solve()
+    
+    # Construct Warmstart for the regularized problem
+    # Augmented Primal: X = [x, lam, mu, z]
+    z_bar = ca.mtimes(qp_base.G, true_sol.x) - qp_base.h
+    x_warm = ca.vertcat(true_sol.x, true_sol.lam, true_sol.mu, z_bar)
+    
+    # Dual variables for the regularized problem (initialized to zero)
+    mu_warm = ca.DM.zeros(NEQ + NINEQ, 1)
+    lam_warm = ca.DM.zeros(NINEQ, 1)
+    
+    warmstart_reg = QPSolution(
+        x=x_warm,
+        mu=mu_warm,
+        lam=lam_warm,
+        residual={},
+        properties={}
+    )
+    
+    # Solve with the warmstart
+    sol_reg = solver_reg.solve(warmstart=warmstart_reg)
+
     
     # Base residual for the unperturbed regularized problem
     max_res_base = max([float(ca.norm_inf(v)) for v in sol_reg.residual.values()])
@@ -62,7 +83,7 @@ for i in range(N_QPS):
     dqp_reg = generate_dqp(NX_reg, NEQ_reg, NINEQ_reg, seed=SEED + i + 2000)
     
     # Compute the analytical directional derivative
-    sol_reg_diff = solver_reg.differentiate(sol_reg, dqp_reg, qp_reg, lstsq=True)
+    sol_reg_diff = solver_reg.differentiate_alt(sol_reg, dqp_reg, qp_reg, lstsq=False)
     
     # ==========================================
     # 3. TAYLOR EXPANSION VERIFICATION
