@@ -252,13 +252,19 @@ def generate_qp(
 
 def generate_dqp(nx: int, neq: int, nineq: int, seed: int) -> QPData:
     np.random.seed(seed)
-    dQ = np.random.randn(nx, nx)
-    dQ = 0.5 * (dQ + dQ.T)
+    
+    # Generate a positive semidefinite perturbation matrix dQ = M @ M.T
+    # We scale by (1 / nx) so the spectral norm of dQ remains around O(1)
+    M = np.random.randn(nx, nx)
+    dQ = (M @ M.T) / nx
     
     return QPData(
-        Q=ca.DM(dQ), q=ca.DM(np.random.randn(nx, 1)),
-        A=ca.DM(np.random.randn(neq, nx)), b=ca.DM(np.random.randn(neq, 1)),
-        G=ca.DM(np.random.randn(nineq, nx)), h=ca.DM(np.random.randn(nineq, 1))
+        Q=ca.DM(dQ), 
+        q=ca.DM(np.random.randn(nx, 1)),
+        A=ca.DM(np.random.randn(neq, nx)), 
+        b=ca.DM(np.random.randn(neq, 1)),
+        G=ca.DM(np.random.randn(nineq, nx)), 
+        h=ca.DM(np.random.randn(nineq, 1))
     )
 
 def perturb_qp(qp: QPData, dqp: QPData, eps: float) -> QPData:
@@ -364,7 +370,7 @@ class QPSolver:
         a_sp = ca.Sparsity.dense(self.neq + self.nineq, self.nx)
         
         # Initialize the CasADi solver object by passing the sparsity patterns.
-        self.solver = ca.conic('qp_solver', "daqp", {'h': h_sp, 'a': a_sp}, options)
+        self.solver = ca.conic('qp_solver', plugin, {'h': h_sp, 'a': a_sp}, options)
 
         # Tolerance when checking for LICQ violations
         self.tol = tol if tol is not None else 1e-5
