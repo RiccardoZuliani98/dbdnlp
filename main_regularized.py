@@ -17,7 +17,7 @@ SOSC = False
 
 # Hyperparameters
 EPS = 1e-8         # Finite difference step size
-RHO = 1e-6         # Regularization parameter
+RHO = 1e-4         # Regularization parameter
 TOLERANCE = 1e-12   # Tolerance for checking constraints
 
 # Data storage for the summary table
@@ -43,8 +43,8 @@ results = {
 
 # Supress solver printing for clean output
 opts = {
-    # 'printLevel': 'none',
-    "plugin":"daqp"
+    'printLevel': 'none',
+    # "plugin":"daqp"
 }
 
 for i in range(N_QPS):
