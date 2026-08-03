@@ -20,7 +20,7 @@ SCS = False
 SOSC = False
 
 # Hyperparameters
-RHO = 1.0  # Regularization parameter
+RHO = 1e-1  # Regularization parameter
 EPS_VALS = [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]  # Perturbation magnitudes
 
 # Data storage for the summary table
@@ -96,7 +96,13 @@ for i in range(N_QPS):
     
     # Compute the analytical directional derivative with respect to theta (eps)
     # Assuming `differentiate` returns an NLPSolution containing dx/dtheta evaluated at eps=0
-    sol_reg_diff = nlp.differentiate(sol_reg, is_regularized=True)
+    sol_reg_diff = nlp.differentiate_reg(
+        theta=eps_0,
+        x=sol_reg.x,
+        lam=sol_reg.lam,
+        nu=sol_reg.nu,
+        rho=RHO
+    )
     
     # ==========================================
     # 4. TAYLOR EXPANSION VERIFICATION
@@ -106,24 +112,24 @@ for i in range(N_QPS):
         
         # B. 0th-Order Evaluation: Evaluate parametric original KKT at eps using NOMINAL solution
         kkt_eval_nom = nlp.kkt_eval(
-            theta_val=eps_val, 
-            x_val=sol_reg.x, 
-            lam_g_val=sol_reg.lam, 
-            lam_h_val=sol_reg.mu
+            theta=eps_val, 
+            x=sol_reg.x, 
+            lam=sol_reg.lam, 
+            nu=sol_reg.nu
         )
         max_kkt_res_nom = max([float(ca.norm_inf(v)) for v in kkt_eval_nom.values()])
         results[f"Nominal KKT (e={eps:.0e})"].append(f"{max_kkt_res_nom:.2e}")
         
         # C. 1st-Order Evaluation: Evaluate parametric original KKT at eps using APPROXIMATE solution
-        x_approx   = sol_reg.x   + eps * sol_reg_diff.x
-        lam_approx = sol_reg.lam + eps * sol_reg_diff.lam
-        mu_approx  = sol_reg.mu  + eps * sol_reg_diff.mu
+        x_approx   = sol_reg.x   + eps * sol_reg_diff["x"]
+        lam_approx = sol_reg.lam + eps * sol_reg_diff["lam"]
+        nu_approx  = sol_reg.nu  + eps * sol_reg_diff["nu"]
         
         kkt_eval_approx = nlp.kkt_eval(
-            theta_val=eps_val, 
-            x_val=x_approx, 
-            lam_g_val=lam_approx, 
-            lam_h_val=mu_approx
+            theta=eps_val, 
+            x=x_approx, 
+            lam=lam_approx, 
+            nu=nu_approx
         )
         max_kkt_res_approx = max([float(ca.norm_inf(v)) for v in kkt_eval_approx.values()])
         results[f"Approx KKT (e={eps:.0e})"].append(f"{max_kkt_res_approx:.2e}")

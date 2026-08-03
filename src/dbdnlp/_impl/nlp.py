@@ -805,7 +805,7 @@ class DifferentiableNLP:
         dnu = d_full[n_x+n_g:, :] if n_h > 0 else np.zeros((0, n_theta))
 
         return {
-            "dx": ca.DM(dx),
-            "dlam": ca.DM(dlam),
-            "dnu": ca.DM(dnu)
+            "x": ca.DM(dx),
+            "lam": ca.DM(dlam),
+            "nu": ca.DM(dnu)
         }
