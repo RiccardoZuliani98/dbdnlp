@@ -13,14 +13,14 @@ class QPData:
     G: ca.DM
     h: ca.DM
 
-def evaluate_kkt(qp: QPData, x: ca.DM, lam:ca.DM, mu:ca.DM) -> Dict[str, ca.DM]:
+def evaluate_kkt(qp: QPData, x: ca.DM, lam:ca.DM, nu:ca.DM) -> Dict[str, ca.DM]:
     """
     Evaluates the KKT conditions for the QP at the given solution.
-    Lagrangian: L = 0.5 x^T Q x + q^T x + mu^T (Ax - b) + lam^T (Gx - h)
+    Lagrangian: L = 0.5 x^T Q x + q^T x + nu^T (Ax - b) + lam^T (Gx - h)
     """
-    # 1. Stationarity: Qx + q + A^T mu + G^T lam = 0
+    # 1. Stationarity: Qx + q + A^T nu + G^T lam = 0
     stationarity = ca.mtimes(qp.Q, x) + qp.q + \
-                   ca.mtimes(qp.A.T, mu) + ca.mtimes(qp.G.T, lam)
+                   ca.mtimes(qp.A.T, nu) + ca.mtimes(qp.G.T, lam)
     
     # 2. Equality constraints: Ax - b = 0
     equality = ca.mtimes(qp.A, x) - qp.b
@@ -77,7 +77,7 @@ def generate_qp(
     h_act = G_act @ x_star
     
     # 4. Multipliers
-    mu_star = np.random.randn(neq, 1)
+    nu_star = np.random.randn(neq, 1)
     lam_star = np.zeros((nineq, 1))
     
     if scs:
@@ -163,7 +163,7 @@ def generate_qp(
     # ====================================================================
     # 8. Solve for q using stationarity: Qx + q + A^T mu + G^T lam = 0
     # ====================================================================
-    q_np = - (Q_np @ x_star + A.T @ mu_star + G.T @ lam_star)
+    q_np = - (Q_np @ x_star + A.T @ nu_star + G.T @ lam_star)
     
     # ====================================================================
     # 9. Pack QP and its solution
@@ -179,13 +179,13 @@ def generate_qp(
         qp=data,
         x=ca.DM(x_star),
         lam=ca.DM(lam_star),
-        mu=ca.DM(mu_star)
+        nu=ca.DM(nu_star)
     )
 
     solution = NLPSolution(
         theta=ca.DM(0,0),
         x=ca.DM(x_star),
-        mu=ca.DM(mu_star),
+        nu=ca.DM(nu_star),
         lam=ca.DM(lam_star),
         properties={
             "ssosc":sosc,
