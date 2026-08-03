@@ -112,7 +112,7 @@ class DifferentiableNLP:
         self.nu_reg = ca.MX.sym('nu_reg', self.n_h)
         self.z_reg = ca.MX.sym('z_reg', self.n_g)
 
-        self.xi = ca.vertcat(self.x, self.z_reg, self.lam_reg, self.nu_reg)
+        self.xi = ca.vertcat(self.x, self.lam_reg, self.nu_reg, self.z_reg)
         self.n_xi = self.xi.size1()
 
         # Evaluate g_theta(x_bar) for penalty term
@@ -122,8 +122,8 @@ class DifferentiableNLP:
         self.f_reg = self.f + (self.rho / 2.0) * (
             ca.sumsqr(self.x - self.x_bar) +
             ca.sumsqr(self.lam_reg) +
-            ca.sumsqr(self.nu_reg)
-            # ca.sumsqr(self.z_reg - g_x_bar)
+            ca.sumsqr(self.nu_reg) +
+            ca.sumsqr(self.z_reg - g_x_bar)
         )
 
         # Constraints for P_2:
@@ -395,7 +395,7 @@ class DifferentiableNLP:
             stationarity = ca.jacobian(lagrangian, self.x).T
 
             # 2. Inequality: just g(x, theta)
-            inequality = self.g
+            inequality = ca.fmax(self.g,0.0)
 
             # 3. Equality: just h(x, theta)
             equality = self.h
@@ -404,7 +404,7 @@ class DifferentiableNLP:
             slackness = lam_g_sym * self.g
 
             # 5. Dual Feasibility: just the inequality multipliers
-            dual_feasibility = lam_g_sym
+            dual_feasibility = ca.fmin(lam_g_sym,0.0)
 
             # Compile into a CasADi Function with named inputs and outputs
             self._kkt_func = ca.Function(

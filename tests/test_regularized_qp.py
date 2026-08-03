@@ -14,7 +14,7 @@ DIMENSIONS = [
 ]
 
 BOOLEANS = [True, False]
-RHO = 0.1
+RHO = 1e-3
 TOLERANCE = 1e-5
 
 
@@ -55,8 +55,28 @@ def test_regularized_qp_restores_properties(nx, neq, nineq, licq, sosc):
         h=h_sym
     )
 
-    # 4. Solve the regularized problem P_2 using the anchor solution
     theta_val = ca.DM.zeros(0, 1)
+
+    # =================================================================
+    # 3.5 NEW: Verify ground-truth solution against original KKT system
+    # =================================================================
+    
+    # Check A: Does the true solution zero the QP generator's internal KKT?
+    max_kkt_gen = max([float(ca.norm_inf(v)) for v in true_sol.kkt_residuals.values()])
+    assert max_kkt_gen < TOLERANCE, f"Generated true_sol KKT residual {max_kkt_gen:.2e} exceeds {TOLERANCE}!"
+
+    # Check B: Does the true solution zero the NLP class's KKT evaluator?
+    kkt_orig = nlp.kkt_eval(
+        theta=theta_val,
+        x=true_sol.x, 
+        lam_g=true_sol.lam, 
+        lam_h=true_sol.mu
+    )
+    max_kkt_orig = max([float(ca.norm_inf(v)) for v in kkt_orig.values()])
+    assert max_kkt_orig < TOLERANCE, f"NLP original KKT residual {max_kkt_orig:.2e} exceeds {TOLERANCE}!"
+
+    # 4. Solve the regularized problem P_2 using the anchor solution
+    
     sol_reg: NLPSolution = nlp.solve_reg(
         theta=theta_val,
         rho=RHO,
