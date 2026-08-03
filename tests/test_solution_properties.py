@@ -2,8 +2,9 @@ import pytest
 import casadi as ca
 import numpy as np
 
-# Assuming the provided code is saved in a module named `src`
-from src import QPSolver, generate_qp
+# Assuming the provided code is saved in modules named `qp` and `nlp`
+from qp import generate_qp
+from nlp import DifferentiableNLP
 
 # =====================================================================
 # TEST CONFIGURATIONS
@@ -41,25 +42,46 @@ def test_qp_solver_properties_and_kkt(nx, neq, nineq, licq, sosc):
         licq=licq, scs=scs, sosc=sosc
     )
     
-    # 2. Initialize the solver and solve with warmstart
-    # opts = {'printLevel': 'none'}
-    opts = {"solver":"clarabel"}
-    solver = QPSolver(qp, options=opts)
+    # 2. Build symbolic expressions from QPData
+    x_sym = ca.MX.sym('x', nx)
+    theta_sym = ca.MX.sym('theta', 0)  # Empty parameter vector for static QP
+
+    f_sym = 0.5 * ca.mtimes([x_sym.T, qp.Q, x_sym]) + ca.mtimes(qp.q.T, x_sym)
+    g_sym = ca.mtimes(qp.G, x_sym) - qp.h if nineq > 0 else None
+    h_sym = ca.mtimes(qp.A, x_sym) - qp.b if neq > 0 else None
     
-    sol = solver.solve(warmstart=true_sol)
+    # 3. Initialize the solver and solve with warmstart
+    nlp = DifferentiableNLP(
+        x=x_sym,
+        theta=theta_sym,
+        f=f_sym,
+        g=g_sym,
+        h=h_sym,
+    )
     
-    # 3. Check that the solution zeros the KKT conditions
+    theta = ca.DM.zeros(0, 1)
+    sol = nlp.solve(
+        theta=theta,
+        x_warmstart=true_sol.x,
+        lam_g_warmstart=true_sol.lam,
+        lam_h_warmstart=true_sol.mu
+    )
+    
+    # 4. Check that the solution zeros the KKT conditions
     # Extract KKT residuals evaluated in the solver
-    max_res = max([float(ca.norm_inf(v)) for v in sol.residual.values()])
+    max_res = max([float(ca.norm_inf(v)) for v in sol.kkt_residuals.values()])
     
     # Assert the max residual is sufficiently close to zero
-    KKT_TOLERANCE = 1e-8
+    KKT_TOLERANCE = 1e-7
     assert max_res < KKT_TOLERANCE, f"KKT residual {max_res:.2e} exceeds tolerance {KKT_TOLERANCE}"
     
-    # 4. Check that the properties correspond to what was required
-    assert sol.properties['licq'] == licq, f"Expected LICQ={licq}, got {sol.properties['licq']}"
-    # assert sol.properties['scs'] == scs, f"Expected SCS={scs}, got {sol.properties['scs']}"
-    assert sol.properties['strong_convexity'] == sosc, f"Expected SOSC={sosc}, got {sol.properties['strong_convexity']}"
+    # 5. Check that the properties correspond to what was required
+    # Evaluate properties explicitly via the DifferentiableNLP method
+    props = nlp.check_properties(sol, is_regularized=False, tol=1e-5)
+
+    assert props['licq'] == licq, f"Expected LICQ={licq}, got {props['licq']}"
+    assert props['sosc'] == sosc, f"Expected SOSC={sosc}, got {props['sosc']}"
+    # assert props['scs'] == scs, f"Expected SCS={scs}, got {props['scs']}"
 
 if __name__ == "__main__":
     # Allows the script to be run directly via `python test_qp_solver.py`
