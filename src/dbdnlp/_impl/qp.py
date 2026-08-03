@@ -2,7 +2,7 @@ import casadi as ca
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict
-from nlp import NLPSolution
+from dbdnlp import NLPSolution
 
 @dataclass
 class QPData:

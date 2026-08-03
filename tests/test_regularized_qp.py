@@ -1,8 +1,8 @@
 import pytest
 import casadi as ca
 
-from qp import generate_qp
-from nlp import DifferentiableNLP, NLPSolution
+from dbdnlp.qp import generate_qp
+from dbdnlp import DifferentiableNLP, NLPSolution
 
 # =====================================================================
 # TEST CONFIGURATIONS

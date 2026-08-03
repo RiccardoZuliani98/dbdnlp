@@ -3,8 +3,8 @@ import casadi as ca
 import numpy as np
 
 # Assuming the provided code is saved in modules named `qp` and `nlp`
-from qp import generate_qp
-from nlp import DifferentiableNLP
+from dbdnlp.qp import generate_qp
+from dbdnlp import DifferentiableNLP
 
 # =====================================================================
 # TEST CONFIGURATIONS
