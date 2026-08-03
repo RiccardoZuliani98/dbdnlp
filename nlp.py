@@ -80,6 +80,7 @@ class DifferentiableNLP:
         self.n_h = self.h.size1()
 
         self.opts = solver_opts if solver_opts is not None else {}
+        self.plugin = self.opts.pop("plugin","ipopt")
 
         # ------------------------------------------------------------------
         # 1. Original NLP Solver: P_1(theta)
@@ -121,8 +122,8 @@ class DifferentiableNLP:
         self.f_reg = self.f + (self.rho / 2.0) * (
             ca.sumsqr(self.x - self.x_bar) +
             ca.sumsqr(self.lam_reg) +
-            ca.sumsqr(self.nu_reg) +
-            ca.sumsqr(self.z_reg - g_x_bar)
+            ca.sumsqr(self.nu_reg)
+            # ca.sumsqr(self.z_reg - g_x_bar)
         )
 
         # Constraints for P_2:
@@ -157,6 +158,7 @@ class DifferentiableNLP:
             'f': self.f_reg,
             'g': self.c_reg_eq
         }
+        self.solver_reg = None
 
         # ------------------------------------------------------------------
         # 3. Lazy Initialization States
@@ -193,7 +195,7 @@ class DifferentiableNLP:
             residual, and some properties.
         """
         if self.solver_orig is None:
-            self.solver_orig = ca.nlpsol('solver_orig', 'ipopt', self._nlp_orig, self.opts)
+            self.solver_orig = ca.nlpsol('solver_orig', self.plugin, self._nlp_orig, self.opts)
 
         args = {
             'p': theta,
@@ -276,7 +278,7 @@ class DifferentiableNLP:
             - 'gamma': Dual multiplier for z <= 0.
         """
         if self.solver_reg is None:
-            self.solver_reg = ca.nlpsol('solver_reg', 'ipopt', self._nlp_reg, self.opts)
+            self.solver_reg = ca.nlpsol('solver_reg', self.plugin, self._nlp_reg, self.opts)
 
         # 1. Automatic Warmstart Construction
         # Evaluate z_0 = g(x_bar, theta)
