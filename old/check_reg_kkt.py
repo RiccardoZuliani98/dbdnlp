@@ -30,7 +30,7 @@ for eps in EPS_VALS:
 
 # Supress solver printing for clean output
 # opts = {'printLevel': 'none'}
-opts = {"solver":"clarabel"}
+opts = {"solver":"piqp"}
 
 for i in range(N_QPS):
     # ==========================================
@@ -83,7 +83,8 @@ for i in range(N_QPS):
     dqp_reg = generate_dqp(NX_reg, NEQ_reg, NINEQ_reg, seed=SEED + i + 2000)
     
     # Compute the analytical directional derivative
-    sol_reg_diff = solver_reg.differentiate_alt(sol_reg, dqp_reg, qp_reg, lstsq=False)
+    # sol_reg_diff = solver_reg.differentiate_alt(sol_reg, dqp_reg, qp_reg, lstsq=True)
+    sol_reg_diff = solver_reg.differentiate(sol_reg, dqp_reg, qp_reg, lstsq=True)
     
     # ==========================================
     # 3. TAYLOR EXPANSION VERIFICATION
