@@ -343,10 +343,10 @@ class DifferentiableNLP:
 
     def kkt_eval(
         self,
-        theta_val: ArrayLike,
-        x_val: ArrayLike,
-        lam_g_val: ArrayLike,
-        lam_h_val: ArrayLike
+        theta: ArrayLike,
+        x: ArrayLike,
+        lam_g: ArrayLike,
+        lam_h: ArrayLike
     ) -> Dict[str, ca.DM]:
         """
         Evaluates the KKT residual vectors of the original, unregularized NLP.
@@ -360,13 +360,13 @@ class DifferentiableNLP:
 
         Parameters
         ----------
-        theta_val : ArrayLike
+        theta : ArrayLike
             Parameter vector theta.
-        x_val : ArrayLike
+        x : ArrayLike
             Primal variable vector x.
-        lam_g_val : ArrayLike
+        lam_g : ArrayLike
             Dual multipliers for inequality constraints g.
-        lam_h_val : ArrayLike
+        lam_h : ArrayLike
             Dual multipliers for equality constraints h.
 
         Returns
@@ -416,10 +416,10 @@ class DifferentiableNLP:
         # Evaluate the compiled function
         # Calling with kwargs returns a dictionary mapped to the output names
         res = self._kkt_func(
-            theta=theta_val, 
-            x=x_val, 
-            lam_g=lam_g_val, 
-            lam_h=lam_h_val
+            theta=theta, 
+            x=x, 
+            lam_g=lam_g, 
+            lam_h=lam_h
         )
 
         return res
@@ -540,34 +540,34 @@ class DifferentiableNLP:
 
     def differentiate(
         self,
-        theta_val: ArrayLike,
-        x_val: ArrayLike,
-        lam_g_val: ArrayLike,
-        lam_h_val: ArrayLike,
-        rho_val: float = 0.0,
-        x_anchor_val: Optional[ArrayLike] = None
+        theta: ArrayLike,
+        x: ArrayLike,
+        lam_g: ArrayLike,
+        lam_h: ArrayLike,
+        rho: float = 0.0,
+        x_anchor: Optional[ArrayLike] = None
     ) -> Dict[str, ca.DM]:
         """
         Computes the sensitivity of the solution vector with respect to theta (dx/dtheta).
 
         Uses the Implicit Function Theorem (IFT) on the KKT condition matrix.
-        If rho_val == 0, differentiates the original NLP system.
-        If rho_val > 0, differentiates the regularized NLP system.
+        If rho == 0, differentiates the original NLP system.
+        If rho > 0, differentiates the regularized NLP system.
 
         Parameters
         ----------
-        theta_val : ArrayLike
+        theta : ArrayLike
             Parameter vector theta.
-        x_val : ArrayLike
+        x : ArrayLike
             Primal solution point x at which to compute derivatives.
-        lam_g_val : ArrayLike
+        lam_g : ArrayLike
             Inequality dual multipliers solution point.
-        lam_h_val : ArrayLike
+        lam_h : ArrayLike
             Equality dual multipliers solution point.
-        rho_val : float, optional
+        rho : float, optional
             Regularization factor rho >= 0. Default is 0.0 (original problem).
-        x_anchor_val : Optional[ArrayLike], optional
-            Anchor point x_anchor (required if rho_val > 0).
+        x_anchor : Optional[ArrayLike], optional
+            Anchor point x_anchor (required if rho > 0).
 
         Returns
         -------
