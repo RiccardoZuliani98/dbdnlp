@@ -694,3 +694,118 @@ class DifferentiableNLP:
             "dlam": ca.DM(dlam),
             "dnu": ca.DM(dnu)
         }
+
+    def differentiate_reg(
+        self,
+        theta: ca.DM,
+        x: ca.DM,
+        lam: ca.DM,
+        nu: ca.DM,
+        rho: float,
+        options: Optional[Dict] = None
+    ) -> Dict[str, ca.DM]:
+        """
+        Computes the parametric sensitivities (dx/dtheta, dlam/dtheta, dnu/dtheta)
+        for the regularized problem by solving the corresponding regularized KKT system.
+        """
+        options = options or {}
+        
+        # ------------------------------------------------------------------
+        # 1. Lazily Evaluate Jacobians and Hessians of the Base Lagrangian
+        # ------------------------------------------------------------------
+        if getattr(self, '_diff_func_orig', None) is None:
+            lam_sym = ca.MX.sym('lam', self.n_g)
+            nu_sym = ca.MX.sym('nu', self.n_h)
+            
+            L = self.f
+            if self.n_g > 0: L += ca.dot(lam_sym, self.g)
+            if self.n_h > 0: L += ca.dot(nu_sym, self.h)
+            
+            H_xx = ca.hessian(L, self.x)[0]
+            J_gx = ca.jacobian(self.g, self.x) if self.n_g > 0 else ca.MX(0, self.n_x)
+            J_hx = ca.jacobian(self.h, self.x) if self.n_h > 0 else ca.MX(0, self.n_x)
+            
+            dL_dx = ca.jacobian(L, self.x).T
+            H_xtheta = ca.jacobian(dL_dx, self.theta)
+            J_gtheta = ca.jacobian(self.g, self.theta) if self.n_g > 0 else ca.MX(0, self.n_theta)
+            J_htheta = ca.jacobian(self.h, self.theta) if self.n_h > 0 else ca.MX(0, self.n_theta)
+            
+            self._diff_func_orig = ca.Function(
+                'diff_orig', 
+                [self.x, self.theta, lam_sym, nu_sym], 
+                [self.g if self.n_g > 0 else ca.MX(0,1), 
+                 H_xx, H_xtheta, J_gx, J_gtheta, J_hx, J_htheta]
+            )
+            
+        g_eval, H_xx_eval, H_xtheta_eval, J_gx_eval, J_gtheta_eval, J_hx_eval, J_htheta_eval = \
+            self._diff_func_orig(x, theta, lam, nu)
+            
+        # ------------------------------------------------------------------
+        # 2. Convert to NumPy arrays
+        # ------------------------------------------------------------------
+        z_np = np.array(g_eval.full()).flatten()      # z = g(x)
+        gamma_np = np.array(lam.full()).flatten()     # gamma = lam
+        
+        H_xx_np = np.array(H_xx_eval.full())
+        H_xtheta_np = np.array(H_xtheta_eval.full())
+        
+        J_gx_np = np.array(J_gx_eval.full())
+        J_gtheta_np = np.array(J_gtheta_eval.full())
+        
+        J_hx_np = np.array(J_hx_eval.full())
+        J_htheta_np = np.array(J_htheta_eval.full())
+
+        n_x, n_theta = self.n_x, self.n_theta
+        n_g, n_h = self.n_g, self.n_h
+
+        # ------------------------------------------------------------------
+        # 3. Assemble and Solve the Regularized Linear System
+        # ------------------------------------------------------------------
+        N_full = n_x + n_g + n_h
+        M = np.zeros((N_full, N_full))
+        N_rhs = np.zeros((N_full, n_theta))
+        
+        # Block 1: Stationarity (Row 1)
+        # H_xx * dx + J_gx^T * dlam + J_hx^T * dnu = -H_xtheta
+        M[:n_x, :n_x] = H_xx_np
+        N_rhs[:n_x, :] = H_xtheta_np
+        if n_g > 0: M[:n_x, n_x:n_x+n_g] = J_gx_np.T
+        if n_h > 0: M[:n_x, n_x+n_g:] = J_hx_np.T
+        
+        # Block 2: Inequality Constraints (Row 2)
+        # J_gx * dx + diag(...) * dlam = -diag(...) * J_gtheta
+        if n_g > 0:
+            M[n_x:n_x+n_g, :n_x] = J_gx_np
+            
+            # Compute denominator (gamma - rho * z) with safety clamping
+            denom = gamma_np - rho * z_np
+            denom[np.abs(denom) < 1e-14] = 1e-14
+            
+            # Compute diagonal modifier term
+            diag_val = (z_np - rho * gamma_np + (rho**2) * z_np) / denom
+            M[n_x:n_x+n_g, n_x:n_x+n_g] = np.diag(diag_val)
+            
+            # Compute RHS multiplier
+            rhs_mult = gamma_np / denom
+            N_rhs[n_x:n_x+n_g, :] = np.diag(rhs_mult) @ J_gtheta_np
+            
+        # Block 3: Equality Constraints (Row 3)
+        # J_hx * dx - rho * I * dnu = -J_htheta
+        if n_h > 0:
+            M[n_x+n_g:, :n_x] = J_hx_np
+            M[n_x+n_g:, n_x+n_g:] = -rho * np.eye(n_h)
+            N_rhs[n_x+n_g:, :] = J_htheta_np
+            
+        # Solve M * d = -N_rhs
+        d_full = np.linalg.solve(M, -N_rhs)
+        
+        # Extract sensitivities
+        dx = d_full[:n_x, :]
+        dlam = d_full[n_x:n_x+n_g, :] if n_g > 0 else np.zeros((0, n_theta))
+        dnu = d_full[n_x+n_g:, :] if n_h > 0 else np.zeros((0, n_theta))
+
+        return {
+            "dx": ca.DM(dx),
+            "dlam": ca.DM(dlam),
+            "dnu": ca.DM(dnu)
+        }
