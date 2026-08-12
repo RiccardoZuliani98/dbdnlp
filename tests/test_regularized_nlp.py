@@ -35,7 +35,7 @@ TOL_DEGENERATE = 1e-4  # see note below
 TOL_DERIV = 1e-5       # relative, vs. central differences
 TOL_CROSS = 1e-8       # relative, analytic vs. analytic
 
-# When SCS fails for P_1 it also fails for P_2 (see test_P2_does_not_restore_SCS).
+# When SCS fails for P_1 it also fails for P_2.
 # An interior-point method cannot drive a component where both z_i and its
 # multiplier vanish below ~sqrt(mu_min); measured floor is ~2e-6 here, and no
 # combination of mu_strategy / bound_relax_factor / mu_target improves it. The
@@ -67,8 +67,8 @@ def build_parametric_nlp(qp, nx, neq, nineq, n_theta, seed):
     P_h = rng.normal(size=(nineq, n_theta)) * 0.1 if nineq else np.zeros((0, n_theta))
     P_b = rng.normal(size=(neq, n_theta)) * 0.1 if neq else np.zeros((0, n_theta))
 
-    x = ca.MX.sym("x", nx)  #type: ignore
-    th = ca.MX.sym("theta", n_theta)  #type: ignore
+    x  = ca.MX.sym("x", nx)           # type: ignore
+    th = ca.MX.sym("theta", n_theta)  # type: ignore
 
     f = 0.5 * ca.mtimes([x.T, ca.DM(qp.Q), x]) + ca.mtimes((ca.DM(qp.q) + ca.mtimes(ca.DM(P_q), th)).T, x)
     g = ca.mtimes(ca.DM(qp.G), x) - (ca.DM(qp.h) + ca.mtimes(ca.DM(P_h), th)) if nineq else None
@@ -76,14 +76,16 @@ def build_parametric_nlp(qp, nx, neq, nineq, n_theta, seed):
 
     return DifferentiableNLP(x=x, theta=th, f=f, g=g, h=h, solver_opts=dict(SOLVER_OPTS))
 
-
 def anchored_params(theta, x_bar, lam_bar, nu_bar, varrho=VARRHO, rho=RHO):
     """Assemble p_reg = [theta; rho_1; rho_2; x_bar; lam_bar; nu_bar]."""
-    return np.concatenate([np.asarray(theta, float).flatten(), [varrho], [rho],
-                           np.asarray(x_bar, float).flatten(),
-                           np.asarray(lam_bar, float).flatten(),
-                           np.asarray(nu_bar, float).flatten()])
-
+    return np.concatenate([
+        np.asarray(theta, float).flatten(),
+        [varrho], 
+        [rho],
+        np.asarray(x_bar, float).flatten(),
+        np.asarray(lam_bar, float).flatten(),
+        np.asarray(nu_bar, float).flatten()
+    ])
 
 def solve_P2(base, reg, theta, phi_bar, varrho=VARRHO, rho=RHO):
     """Solve P_2(theta, phi_bar) and split xi = [x; lam; nu; z]."""
@@ -95,36 +97,43 @@ def solve_P2(base, reg, theta, phi_bar, varrho=VARRHO, rho=RHO):
     xi = np.array(sol.x).flatten()
     return xi[:nx], xi[nx:nx + ng], xi[nx + ng:nx + ng + nh], xi[nx + ng + nh:], sol
 
-
 def as_np(dm):
     return np.array(ca.DM(dm).full())
 
-
 def rel_err(a, b):
     return float(np.max(np.abs(a - b)) / max(1.0, float(np.max(np.abs(b)))))
-
 
 @pytest.fixture
 def setup(request):
     """(base nlp, regularized nlp, theta0, phi_bar) for one parameter combination."""
     nx, neq, nineq, licq, scs, sosc = request.param
     seed = 42 + nx + neq + nineq + int(licq) + 2 * int(scs) + 4 * int(sosc)
-    qp, true_sol = generate_qp(nx=nx, neq=neq, nineq=nineq, seed=seed,
-                               licq=licq, scs=scs, sosc=sosc)
+    qp, true_sol = generate_qp(
+        nx=nx, neq=neq, nineq=nineq, seed=seed,
+        licq=licq, scs=scs, sosc=sosc
+    )
     base = build_parametric_nlp(qp, nx, neq, nineq, N_THETA, seed)
     reg = build_regularized_nlp(base.sym, solver_opts=dict(SOLVER_OPTS))
     theta0 = np.zeros(N_THETA)
-    phi_bar = (np.asarray(true_sol.x, float).flatten(),
-               np.asarray(true_sol.lam, float).flatten(),
-               np.asarray(true_sol.nu, float).flatten())
+    phi_bar = (
+        np.asarray(true_sol.x, float).flatten(),
+        np.asarray(true_sol.lam, float).flatten(),
+        np.asarray(true_sol.nu, float).flatten()
+    )
     return base, reg, theta0, phi_bar, dict(licq=licq, scs=scs, sosc=sosc)
 
 
 def _params(scs_values=BOOLEANS):
-    return [pytest.param((nx, neq, nineq, licq, scs, sosc),
-                         id=f"nx{nx}-neq{neq}-nineq{nineq}-licq{int(licq)}-scs{int(scs)}-sosc{int(sosc)}")
+    return [
+        pytest.param((
+                nx, neq, nineq, licq, scs, sosc
+            ), id=f"nx{nx}-neq{neq}-nineq{nineq}-licq{int(licq)}-scs{int(scs)}-sosc{int(sosc)}"
+        )
             for (nx, neq, nineq) in DIMENSIONS
-            for licq in BOOLEANS for scs in scs_values for sosc in BOOLEANS]
+            for licq in BOOLEANS 
+            for scs in scs_values # this way we can enforce scs = True always
+            for sosc in BOOLEANS
+        ]
 
 
 # =====================================================================
@@ -139,8 +148,10 @@ def test_P2_reproduces_the_anchor_solution(setup):
 
     # sanity: the anchor really is a KKT point of P_1
     stat, ineq, eq, slack, dfeas = base.funcs.kkt(theta0, x_bar, lam_bar, nu_bar)
-    for name, v in [("stationarity", stat), ("inequality", ineq), ("equality", eq),
-                    ("slackness", slack), ("dual_feasibility", dfeas)]:
+    for name, v in [
+        ("stationarity", stat), ("inequality", ineq), ("equality", eq),
+        ("slackness", slack), ("dual_feasibility", dfeas)
+    ]:
         assert float(ca.norm_inf(v)) < TOL_SOLUTION, f"anchor violates {name}"
 
     x, lam, nu, z, _ = solve_P2(base, reg, theta0, phi_bar)
@@ -176,7 +187,7 @@ def test_P2_pins_down_duals_even_without_LICQ(setup):
 # =====================================================================
 
 def _reduced_hessian_min_eig(base, theta, x, lam, nu, active_tol=1e-6):
-    H, _, J_g, _, J_h, _ = base.funcs.ift(x, theta, lam, nu)
+    H, _, J_g, _, J_h, _ = base.funcs.ift(x, lam, nu, theta)
     H = as_np(H).reshape(base.n_x, base.n_x)
     J_g = as_np(J_g).reshape(base.n_ineq, base.n_x)
     J_h = as_np(J_h).reshape(base.n_eq, base.n_x)
@@ -201,18 +212,17 @@ def test_P2_restores_LICQ_unconditionally(setup):
 
 @pytest.mark.parametrize("setup", _params(), indirect=True)
 def test_P2_restores_second_order_conditions(setup):
-    """
-    The Hessian of L_2 in xi is blkdiag(H_xx + varrho*I, rho*I, rho*I, varrho*I),
-    so SOSC needs varrho > -lambda_min(reduced H_xx). For a convex QP that lower
-    bound is <= 0 and any varrho > 0 works; the assertion is written against the
-    real condition so it stays valid for nonconvex problems too.
-    """
+    """Verify that SOSC is restored."""
     base, reg, theta0, phi_bar, flags = setup
     mu_min = _reduced_hessian_min_eig(base, theta0, *phi_bar)
-    varrho = max(VARRHO, -mu_min + 1e-3) if np.isfinite(mu_min) else VARRHO
+    # varrho = max(VARRHO, -mu_min + 1e-3) if np.isfinite(mu_min) else VARRHO
+    varrho = VARRHO
 
     x, lam, nu, z, sol = solve_P2(base, reg, theta0, phi_bar, varrho=varrho)
-    props = reg.check_properties(anchored_params(theta0, *phi_bar, varrho=varrho), sol.x, sol.lam, sol.nu)
+    props = reg.check_properties(
+        anchored_params(theta0, *phi_bar, varrho=varrho), 
+        sol.x, sol.lam, sol.nu
+    )
 
     assert props["sosc"] is True, f"P_2 failed SOSC (P_1 sosc={flags['sosc']}, mu_min={mu_min:.2e})"
     if flags["scs"]:
@@ -233,8 +243,11 @@ def test_P2_does_not_restore_SCS(setup):
     x, lam, nu, z, sol = solve_P2(base, reg, theta0, phi_bar)
     # active_tol must exceed the achievable solve accuracy at a degenerate
     # component, or the weakly active z_i is misread as strictly inactive.
-    props = reg.check_properties(anchored_params(theta0, *phi_bar), sol.x, sol.lam, sol.nu,
-                                 active_tol=TOL_DEGENERATE)
+    props = reg.check_properties(
+        anchored_params(theta0, *phi_bar), 
+        sol.x, sol.lam, sol.nu,
+        active_tol=TOL_DEGENERATE
+    )
     assert props["scs"] is flags["scs"], "SCS of P_2 should mirror SCS of P_1"
 
 
@@ -251,8 +264,10 @@ def test_regularized_sensitivity_matches_finite_differences(setup):
     base, reg, theta0, phi_bar, flags = setup
     nx, ng, nh = base.n_x, base.n_ineq, base.n_eq
 
-    d = base.differentiate(theta0, *phi_bar, mode="regularized",
-                           options={"rho_1": VARRHO, "rho_2": RHO})
+    d = base.differentiate(
+        theta0, *phi_bar, mode="regularized",
+        options={"rho_1": VARRHO, "rho_2": RHO}
+    )
     analytic = np.vstack([as_np(d["x"]), as_np(d["lam"]), as_np(d["nu"])])
 
     fd = np.zeros((nx + ng + nh, N_THETA))
@@ -309,8 +324,10 @@ def test_regularized_mode_equals_full_KKT_differentiation_of_P2(setup):
     base, reg, theta0, phi_bar, flags = setup
     nx, ng, nh = base.n_x, base.n_ineq, base.n_eq
 
-    d_red = base.differentiate(theta0, *phi_bar, mode="regularized",
-                               options={"rho_1": VARRHO, "rho_2": RHO})
+    d_red = base.differentiate(
+        theta0, *phi_bar, mode="regularized",
+        options={"rho_1": VARRHO, "rho_2": RHO}
+    )
     reduced = np.vstack([as_np(d_red["x"]), as_np(d_red["lam"]), as_np(d_red["nu"])])
 
     p = anchored_params(theta0, *phi_bar)
@@ -322,7 +339,6 @@ def test_regularized_mode_equals_full_KKT_differentiation_of_P2(setup):
     full = as_np(d_full["x"])[:nx + ng + nh, :N_THETA]
 
     assert rel_err(reduced, full) < TOL_CROSS, f"rel err {rel_err(reduced, full):.3e}"
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

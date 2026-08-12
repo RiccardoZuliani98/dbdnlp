@@ -459,7 +459,7 @@ class DifferentiableNLP:
             n_weakly_active, sosc_exact, and kkt_residual.
         """
         # --- 1. Reuse the eagerly compiled ift function -------------------------
-        H_L_dm, _, J_g_dm, _, J_h_dm, _ = self.funcs.ift(x, theta, lam, nu)
+        H_L_dm, _, J_g_dm, _, J_h_dm, _ = self.funcs.ift(x, lam, nu, theta)
 
         H_L = np.array(ca.DM(H_L_dm).full()).reshape(self.n_x, self.n_x)
         J_g = np.array(ca.DM(J_g_dm).full()).reshape(self.n_ineq, self.n_x)
@@ -469,7 +469,7 @@ class DifferentiableNLP:
         lam_np = np.array(ca.DM(lam).full()).flatten()
 
         # --- 2. Guard: these conditions are only meaningful at a KKT point ------
-        stat, _, eq, _, dual_feas = self.funcs.kkt(theta, x, lam, nu)
+        stat, _, eq, _, dual_feas = self.funcs.kkt(x, lam, nu, theta)
         kkt_res = float(max(
             np.max(np.abs(np.array(ca.DM(stat).full()))) if self.n_x else 0.0,
             np.max(np.abs(np.array(ca.DM(eq).full()))) if self.n_eq else 0.0,
