@@ -1,6 +1,7 @@
 import casadi as ca
 import numpy as np
 from typing import Dict, Optional, cast, Any
+import scipy
 
 from dbdnlp._impl.types import (
     NLPFunctions, NLPSolution, NLPSymbolic, Symbolic,
@@ -352,8 +353,58 @@ class DifferentiableNLP:
                 dlam[active_idx, :] = d_act[n_x:n_x + n_act, :]
             dnu = d_act[n_x + n_act:, :] if n_h > 0 else np.zeros((0, n_theta))
 
+        elif mode == "regularized":
+
+            # get regularization parameters
+            rho_1 = opts.get("rho_1")
+            rho_2 = opts.get("rho_2")
+
+            if rho_1 is None or rho_2 is None:
+                raise ValueError("Options 'rho_1' and 'rho_2' must be provided for 'regularized' mode.")
+
+            N_full = n_x + n_g + n_h
+            M = np.zeros((N_full, N_full))
+            N_rhs = np.zeros((N_full, n_theta))
+
+            # Block 1: Regularized Stationarity
+            M[:n_x, :n_x] = H_xx_np + rho_1 * np.eye(n_x)
+            N_rhs[:n_x, :] = H_xtheta_np
+            if n_g > 0: 
+                M[:n_x, n_x:n_x + n_g] = J_gx_np.T
+            if n_h > 0: 
+                M[:n_x, n_x + n_g:] = J_hx_np.T
+            
+            # Block 2: Regularized Inequality Constraints
+            if n_g > 0:
+                M[n_x:n_x + n_g, :n_x] = J_gx_np
+                
+                # Compute denominator (gamma - rho * z) with safety clamping
+                denom = lam_np - rho_1 * g_np
+                denom[np.abs(denom) < 1e-14] = 1e-14
+                
+                # Compute diagonal modifier term
+                diag_val = g_np / denom - rho_2
+                M[n_x:n_x + n_g, n_x:n_x + n_g] = np.diag(diag_val)
+                
+                # Compute RHS multiplier
+                rhs_mult = lam_np / denom
+                N_rhs[n_x:n_x + n_g, :] = np.diag(rhs_mult) @ J_gtheta_np
+                
+            # Block 3: Regularized Equality Constraints
+            if n_h > 0:
+                M[n_x + n_g:, :n_x] = J_hx_np
+                M[n_x + n_g:, n_x + n_g:] = -rho_2 * np.eye(n_h)
+                N_rhs[n_x + n_g:, :] = J_htheta_np
+                
+            # Solve symmetric linear system using scipy
+            d_full = scipy.linalg.solve(M, -N_rhs, assume_a='sym')
+            
+            dx = d_full[:n_x, :]
+            dlam = d_full[n_x:n_x + n_g, :] if n_g > 0 else np.zeros((0, n_theta))
+            dnu = d_full[n_x + n_g:, :] if n_h > 0 else np.zeros((0, n_theta))
+
         else:
-            raise ValueError(f"Unknown mode '{mode}'. Choose 'full' or 'active_set'.")
+            raise ValueError(f"Unknown mode '{mode}'. Choose 'full', 'active_set', or 'regularized'.")
 
         return {
             "x": ca.DM(dx),
