@@ -1,7 +1,7 @@
 import casadi as ca
 import numpy as np
 from typing import Dict, Optional, cast, Any
-from scipy.linalg import solve as sp_solve
+from scipy.linalg import solve, null_space
 
 from dbdnlp._impl.types import (
     NLPFunctions, NLPSolution, NLPSymbolic, Symbolic,
@@ -401,7 +401,7 @@ class DifferentiableNLP:
                 N_rhs[n_x + n_g:, :] = J_htheta_np
                 
             # Solve symmetric linear system using scipy
-            d_full = sp_solve(M, -N_rhs, assume_a='sym')
+            d_full = solve(M, -N_rhs, assume_a='sym')
             
             dx = d_full[:n_x, :]
             dlam = d_full[n_x:n_x + n_g, :] if n_g > 0 else np.zeros((0, n_theta))
@@ -415,3 +415,122 @@ class DifferentiableNLP:
             "lam": ca.DM(dlam),
             "nu": ca.DM(dnu)
         }
+
+    def check_properties(
+        self,
+        theta: "ArrayLike",
+        x: "ArrayLike",
+        lam: "ArrayLike",
+        nu: "ArrayLike",
+        active_tol: float = 1e-6,
+        rank_tol: Optional[float] = None,
+        pd_tol: float = 1e-8,
+    ) -> Dict[str, Any]:
+        """
+        Evaluates LICQ, SCS, SOSC and SSOSC at the primal-dual point (x, lam, nu).
+
+        Works unmodified for both the base NLP and the augmented problem returned by
+        `build_regularized_nlp`, since the latter is itself a DifferentiableNLP whose
+        primal is xi, parameter is p_reg, inequality is z <= 0 and equality is h_reg.
+
+        Sign convention follows the rest of the class: L = f + lam^T g + nu^T h with
+        g(x) <= 0 and lam >= 0.
+
+        Parameters
+        ----------
+        active_tol : float
+            Threshold on g for declaring an inequality active, and on lam for
+            declaring it strongly active.
+        rank_tol : Optional[float]
+            Passed to `np.linalg.matrix_rank`. None uses NumPy's scale-aware default
+            (max(M, N) * eps * sigma_max), which is what you want unless you have a
+            specific absolute threshold in mind.
+        pd_tol : float
+            Relative threshold on the smallest eigenvalue of the reduced Hessian.
+
+        Returns
+        -------
+        Dict[str, Any]
+            licq, scs, sosc, ssosc (bool), plus diagnostics: n_active,
+            n_weakly_active, sosc_exact, and kkt_residual.
+        """
+        # --- 1. Reuse the eagerly compiled ift function -------------------------
+        H_L_dm, _, J_g_dm, _, J_h_dm, _ = self.funcs.ift(x, theta, lam, nu)
+
+        H_L = np.array(ca.DM(H_L_dm).full()).reshape(self.n_x, self.n_x)
+        J_g = np.array(ca.DM(J_g_dm).full()).reshape(self.n_ineq, self.n_x)
+        J_h = np.array(ca.DM(J_h_dm).full()).reshape(self.n_eq, self.n_x)
+
+        g_np = np.array(ca.DM(self.funcs.ineq(x, theta)).full()).flatten()
+        lam_np = np.array(ca.DM(lam).full()).flatten()
+
+        # --- 2. Guard: these conditions are only meaningful at a KKT point ------
+        stat, _, eq, _, dual_feas = self.funcs.kkt(theta, x, lam, nu)
+        kkt_res = float(max(
+            np.max(np.abs(np.array(ca.DM(stat).full()))) if self.n_x else 0.0,
+            np.max(np.abs(np.array(ca.DM(eq).full()))) if self.n_eq else 0.0,
+            np.max(np.abs(np.array(ca.DM(dual_feas).full()))) if self.n_ineq else 0.0,
+        ))
+
+        # --- 3. Active / strongly active / weakly active sets -------------------
+        active = np.where(g_np >= -active_tol)[0]
+        strict = active[lam_np[active] > active_tol] if active.size else active
+        weak = np.setdiff1d(active, strict)
+
+        def stacked(idx: np.ndarray) -> np.ndarray:
+            return np.vstack([J_h, J_g[idx, :]])  # both are (k, n_x), empty is fine
+
+        J_act = stacked(active)
+        J_str = stacked(strict)
+
+        # --- 4. LICQ: active constraint gradients linearly independent ----------
+        licq = True
+        if J_act.shape[0] > 0:
+            licq = bool(np.linalg.matrix_rank(J_act, tol=rank_tol) == J_act.shape[0])
+
+        # --- 5. SCS: no weakly active inequality --------------------------------
+        scs = bool(weak.size == 0)
+
+        # --- 6. Second order conditions -----------------------------------------
+        def pd_on_nullspace(H: np.ndarray, J: np.ndarray) -> bool:
+            Z = np.eye(H.shape[0]) if J.shape[0] == 0 else null_space(J, rcond=rank_tol)
+            if Z.shape[1] == 0:
+                return True  # vacuously: the critical subspace is trivial
+            H_red = Z.T @ H @ Z
+            H_red = 0.5 * (H_red + H_red.T)
+            scale = max(1.0, float(np.max(np.abs(H_red))))
+            return bool(np.min(np.linalg.eigvalsh(H_red)) > pd_tol * scale)
+
+        # SSOSC drops the weakly active rows, so null(J_str) contains null(J_act):
+        # it is the strictly stronger test, and SSOSC => SOSC.
+        sosc_subspace = pd_on_nullspace(H_L, J_act)
+        ssosc = pd_on_nullspace(H_L, J_str)
+
+        # The true SOSC critical cone is
+        #   C = {d : J_h d = 0, J_g[i] d = 0 for strongly active i,
+        #                       J_g[i] d <= 0 for weakly active i}
+        # which is a cone, not a subspace. null(J_act) is a strict subset of C
+        # whenever a weakly active constraint exists, so the subspace test is
+        # optimistic there. It is exact iff SCS holds; SSOSC is a rigorous
+        # sufficient certificate in all cases.
+        sosc = bool(ssosc or sosc_subspace)
+        sosc_exact = bool(scs or ssosc)
+
+        return {
+            "licq": licq,
+            "scs": scs,
+            "sosc": sosc,
+            "ssosc": ssosc,
+            "sosc_exact": sosc_exact,
+            "n_active": int(active.size),
+            "n_weakly_active": int(weak.size),
+            "kkt_residual": kkt_res,
+        }
+
+    def annotate_solution(self, sol: "NLPSolution", **kwargs) -> Dict[str, Any]:
+        """Thin wrapper: evaluate properties at `sol` and store them on it."""
+        props = self.check_properties(sol.theta, sol.x, sol.lam, sol.nu, **kwargs)
+        if sol.properties is None:
+            sol.properties = {}
+        sol.properties.update(props)
+        return props

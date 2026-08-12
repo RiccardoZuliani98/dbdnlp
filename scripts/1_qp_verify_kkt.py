@@ -20,7 +20,8 @@ SCS = False
 SOSC = False
 
 # Hyperparameters
-RHO = 1e-1  # Regularization parameter
+RHO_1 = 1   # Regularization parameter primal
+RHO_2 = 1.0   # Regularization parameter dual
 EPS_VALS = [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]  # Perturbation magnitudes
 
 # Data storage for the summary table
@@ -84,7 +85,8 @@ for i in range(N_QPS):
     eps_0 = ca.DM([0.0])
     sol_reg = nlp.solve_reg(
         theta=eps_0,
-        rho=RHO,
+        rho_1=RHO_1,
+        rho_2=RHO_2,
         x_bar=true_sol.x,
         lam_bar=true_sol.lam,
         nu_bar=true_sol.nu
@@ -101,7 +103,8 @@ for i in range(N_QPS):
         x=sol_reg.x,
         lam=sol_reg.lam,
         nu=sol_reg.nu,
-        rho=RHO
+        rho_1=RHO_1,
+        rho_2=RHO_2
     )
     
     # ==========================================
@@ -138,7 +141,7 @@ for i in range(N_QPS):
 # PRINT SUMMARY TABLE
 # =====================================================================
 print(f"Taylor Expansion Verification on {N_QPS} Regularized QPs")
-print(f"Base Dimensions: NX={NX}, NEQ={NEQ}, NINEQ={NINEQ} | Regularization RHO={RHO}")
+print(f"Base Dimensions: NX={NX}, NEQ={NEQ}, NINEQ={NINEQ} | Regularization RHO_1={RHO_1} | Regularization RHO_2={RHO_2}")
 print("=" * (25 + 12 * N_QPS))
 
 # Build header

@@ -43,8 +43,8 @@ def test_qp_solver_properties_and_kkt(nx, neq, nineq, licq, sosc):
     )
     
     # 2. Build symbolic expressions from QPData
-    x_sym = ca.MX.sym('x', nx)
-    theta_sym = ca.MX.sym('theta', 0)  # Empty parameter vector for static QP
+    x_sym = ca.MX.sym('x', nx) # type: ignore
+    theta_sym = ca.MX.sym('theta', 0)  # Empty parameter vector for static QP # type: ignore
 
     f_sym = 0.5 * ca.mtimes([x_sym.T, qp.Q, x_sym]) + ca.mtimes(qp.q.T, x_sym)
     g_sym = ca.mtimes(qp.G, x_sym) - qp.h if nineq > 0 else None
@@ -59,12 +59,12 @@ def test_qp_solver_properties_and_kkt(nx, neq, nineq, licq, sosc):
         h=h_sym,
     )
     
-    theta = ca.DM.zeros(0, 1)
+    theta = ca.DM(0, 1)
     sol = nlp.solve(
         theta=theta,
         x_warmstart=true_sol.x,
-        lam_g_warmstart=true_sol.lam,
-        lam_h_warmstart=true_sol.mu
+        lam_warmstart=true_sol.lam,
+        nu_warmstart=true_sol.nu
     )
     
     # 4. Check that the solution zeros the KKT conditions
@@ -77,7 +77,12 @@ def test_qp_solver_properties_and_kkt(nx, neq, nineq, licq, sosc):
     
     # 5. Check that the properties correspond to what was required
     # Evaluate properties explicitly via the DifferentiableNLP method
-    props = nlp.check_properties(sol, is_regularized=False, tol=1e-5)
+    props = nlp.check_properties(
+        theta=sol.theta,
+        x=sol.x,
+        lam=sol.lam,
+        nu=sol.nu
+    )
 
     assert props['licq'] == licq, f"Expected LICQ={licq}, got {props['licq']}"
     assert props['sosc'] == sosc, f"Expected SOSC={sosc}, got {props['sosc']}"
