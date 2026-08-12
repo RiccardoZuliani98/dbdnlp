@@ -100,40 +100,40 @@ class NLPSymbolic:
 # ---------------------------------------------------------------------------
 
 CostFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike], ArrayLike],
+    Callable[[ArrayLike, ArrayLike], ca.DM],
     "Inputs: (x: n_x, theta: n_theta) -> Output: f (1x1)"
 ]
 
 IneqFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike], ArrayLike],
+    Callable[[ArrayLike, ArrayLike], ca.DM],
     "Inputs: (x: n_x, theta: n_theta) -> Output: g (n_g x 1)"
 ]
 
 EqFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike], ArrayLike],
+    Callable[[ArrayLike, ArrayLike], ca.DM],
     "Inputs: (x: n_x, theta: n_theta) -> Output: h (n_h x 1)"
 ]
 
 CstFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike], ArrayLike],
+    Callable[[ArrayLike, ArrayLike], ca.DM],
     "Inputs: (x: n_x, theta: n_theta) -> Output: c (n_g + n_h x 1)"
 ]
 
 LagrFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike, ArrayLike, ArrayLike], ArrayLike],
-    "Inputs: (x: n_x, theta: n_theta, lam: n_g, nu: n_h) -> Output: L (1x1)"
+    Callable[[ArrayLike, ArrayLike, ArrayLike, ArrayLike], ca.DM],
+    "Inputs: (x: n_x, lam: n_g, nu: n_h, theta: n_theta) -> Output: L (1x1)"
 ]
 
 # CasADi functions with multiple outputs return a tuple (or list) when called positionally.
 KKTFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike, ArrayLike, ArrayLike], Tuple[ArrayLike, ...]],
-    "Inputs: (theta: n_theta, x: n_x, lam: n_g, nu: n_h) -> "
+    Callable[[ArrayLike, ArrayLike, ArrayLike, ArrayLike], Tuple[ca.DM, ...]],
+    "Inputs: (x: n_x, lam: n_g, nu: n_h, theta: n_theta) -> "
     "Outputs: (stationarity: n_x, ineq: n_g, eq: n_h, slack: n_g, dual_feas: n_g)"
 ]
 
 IFTFuncType = Annotated[
-    Callable[[ArrayLike, ArrayLike, ArrayLike, ArrayLike], Tuple[ArrayLike, ...]],
-    "Inputs: (x: n_x, theta: n_theta, lam: n_g, nu: n_h) -> "
+    Callable[[ArrayLike, ArrayLike, ArrayLike, ArrayLike], Tuple[ca.DM, ...]],
+    "Inputs: (x: n_x, lam: n_g, nu: n_h, theta: n_theta) -> "
     "Outputs: (H_xx: n_x x n_x, H_xtheta: n_x x n_theta, "
     "J_gx: n_g x n_x, J_gtheta: n_g x n_theta, "
     "J_hx: n_h x n_x, J_htheta: n_h x n_theta)"
@@ -159,15 +159,15 @@ class NLPFunctions:
         Evaluates stacked constraints [g; h].
         Inputs:  [x, theta] -> Output: [c] (n_c, 1)
     lagr : ca.Function
-        Evaluates the Lagrangian L(x, theta, lam, nu) = f + lam^T g + nu^T h.
-        Inputs:  [x, theta, lam, nu] -> Output: [L] (1, 1)
+        Evaluates the Lagrangian L(x, lam, nu, theta) = f + lam^T g + nu^T h.
+        Inputs:  [x, lam, nu, theta] -> Output: [L] (1, 1)
     kkt : ca.Function
         Evaluates exact KKT residual vectors.
-        Inputs:  [theta, x, lam, nu] 
+        Inputs:  [x, lam, nu, theta] 
         Outputs: ['stationarity', 'inequality', 'equality', 'slackness', 'dual_feasibility']
     ift : ca.Function
         Evaluates Jacobians and Hessians for Implicit Function Theorem differentiation.
-        Inputs:  [x, theta, lam, nu] 
+        Inputs:  [x, lam, nu, theta] 
         Outputs: [H_xx (n_x, n_x), H_xtheta (n_x, n_theta), 
                   J_gx (n_g, n_x), J_gtheta (n_g, n_theta), 
                   J_hx (n_h, n_x), J_htheta (n_h, n_theta)]
