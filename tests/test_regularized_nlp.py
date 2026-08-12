@@ -147,7 +147,7 @@ def test_P2_reproduces_the_anchor_solution(setup):
     tol = TOL_SOLUTION if flags["scs"] else TOL_DEGENERATE
 
     # sanity: the anchor really is a KKT point of P_1
-    stat, ineq, eq, slack, dfeas = base.funcs.kkt(theta0, x_bar, lam_bar, nu_bar)
+    stat, ineq, eq, slack, dfeas = base.funcs.kkt(x_bar, lam_bar, nu_bar, theta0)
     for name, v in [
         ("stationarity", stat), ("inequality", ineq), ("equality", eq),
         ("slackness", slack), ("dual_feasibility", dfeas)
@@ -166,7 +166,7 @@ def test_P2_reproduces_the_anchor_solution(setup):
         assert np.max(np.abs(z - g_bar)) < tol
 
     # and the recovered point must still zero the ORIGINAL KKT system
-    stat, ineq, eq, slack, dfeas = base.funcs.kkt(theta0, x, lam, nu)
+    stat, ineq, eq, slack, dfeas = base.funcs.kkt(x, lam, nu, theta0)
     assert max(float(ca.norm_inf(v)) for v in (stat, ineq, eq, slack, dfeas)) < tol
 
 
