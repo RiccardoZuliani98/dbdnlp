@@ -1,7 +1,7 @@
 import casadi as ca
 import numpy as np
 from typing import Dict, Optional, cast, Any
-import scipy
+from scipy.linalg import solve as sp_solve
 
 from dbdnlp._impl.types import (
     NLPFunctions, NLPSolution, NLPSymbolic, Symbolic,
@@ -46,9 +46,16 @@ class DifferentiableNLP:
         solver_opts : Optional[Dict], optional
             Dictionary of options passed to `casadi.nlpsol`.
         """
+
+        # identify symbolic type
+        if isinstance(x, ca.SX):
+            sym_type = ca.SX
+        else:
+            sym_type = ca.MX
+
         # 1. Normalize Constraints and Dimensions
-        g = g if g is not None else ca.MX(0, 1)
-        h = h if h is not None else ca.MX(0, 1)
+        g = g if g is not None else sym_type(0, 1)
+        h = h if h is not None else sym_type(0, 1)
 
         self.n_x = x.size1()
         self.n_theta = theta.size1()
@@ -57,11 +64,6 @@ class DifferentiableNLP:
         self.n_c = self.n_ineq + self.n_eq
 
         # 2. Initialize Symbolic Multipliers
-        # Assuming MX by default to match original implementation; adjust if supporting SX
-        if isinstance(x, ca.SX):
-            sym_type = ca.SX
-        else:
-            sym_type = ca.MX
         lam = cast(Symbolic, sym_type.sym('lam', self.n_ineq)) #type:ignore
         nu  = cast(Symbolic, sym_type.sym('nu', self.n_eq))  #type:ignore
 
@@ -108,10 +110,10 @@ class DifferentiableNLP:
         H_xtheta = ca.jacobian(dL_dx, theta)
         
         # Safely handle empty constraints for Jacobians
-        J_gx = ca.jacobian(g, x) if self.n_ineq > 0 else ca.MX(0, self.n_x)
-        J_gtheta = ca.jacobian(g, theta) if self.n_ineq > 0 else ca.MX(0, self.n_theta)
-        J_hx = ca.jacobian(h, x) if self.n_eq > 0 else ca.MX(0, self.n_x)
-        J_htheta = ca.jacobian(h, theta) if self.n_eq > 0 else ca.MX(0, self.n_theta)
+        J_gx = ca.jacobian(g, x) if self.n_ineq > 0 else sym_type(0, self.n_x)
+        J_gtheta = ca.jacobian(g, theta) if self.n_ineq > 0 else sym_type(0, self.n_theta)
+        J_hx = ca.jacobian(h, x) if self.n_eq > 0 else sym_type(0, self.n_x)
+        J_htheta = ca.jacobian(h, theta) if self.n_eq > 0 else sym_type(0, self.n_theta)
 
         ift_func = ca.Function(
             'ift', 
@@ -136,7 +138,7 @@ class DifferentiableNLP:
         )
 
         # 5. Initialize Solver Configuration
-        self.opts = solver_opts if solver_opts is not None else {}
+        self.opts = dict(solver_opts) if solver_opts else {}
         self.plugin = self.opts.pop("plugin", "ipopt")
 
         nlp_dict = {
@@ -379,8 +381,10 @@ class DifferentiableNLP:
                 M[n_x:n_x + n_g, :n_x] = J_gx_np
                 
                 # Compute denominator (gamma - rho * z) with safety clamping
+                eps = 1e-10
                 denom = lam_np - rho_1 * g_np
-                denom[np.abs(denom) < 1e-14] = 1e-14
+                sgn = np.where(denom < 0.0, -1.0, 1.0)
+                denom = sgn * np.maximum(np.abs(denom), eps)
                 
                 # Compute diagonal modifier term
                 diag_val = g_np / denom - rho_2
@@ -397,7 +401,7 @@ class DifferentiableNLP:
                 N_rhs[n_x + n_g:, :] = J_htheta_np
                 
             # Solve symmetric linear system using scipy
-            d_full = scipy.linalg.solve(M, -N_rhs, assume_a='sym')
+            d_full = sp_solve(M, -N_rhs, assume_a='sym')
             
             dx = d_full[:n_x, :]
             dlam = d_full[n_x:n_x + n_g, :] if n_g > 0 else np.zeros((0, n_theta))
