@@ -14,33 +14,40 @@ from degnlp.core import stack_sensitivities
 from degnlp.reference import IFT, FiniteDifferenceOracle, Regularized
 from degnlp.report import jacobian_for
 
+NAMES = ["fold", "cusp", "pitchfork", "swallowtail"]
 
 def rule(title):
     print("\n" + "=" * 78)
     print(title)
     print("=" * 78)
 
-
-# --------------------------------------------------------------------------
 rule("0. the library checks itself: measured vs declared Hoelder exponents")
 for h in report.validate_examples():
     flag = "ok " if all(h.matches_expected.values()) else "BAD"
     got = {s: ("none" if not h.exists[s] else f"{h.exponent[s]:.3f}") for s in "+-"}
     print(f" {flag}  {h.example:<24}{h.direction:<14}{got}")
 
-# --------------------------------------------------------------------------
 rule("0b. hypotheses at each reference point, from check_properties")
 print(report.property_table())
 
 rule("1. full suite, differentiate(mode='regularized') at rho_1 = rho_2 = 1e-3")
-print(report.run_suite(Regularized(rho_1=1e-3, rho_2=1e-3)))
+print(report.run_suite(
+    differentiator=Regularized(rho_1=1e-3, rho_2=1e-3),
+    names=NAMES
+))
 
 rule("2. same suite, finite-difference oracle (positive control)")
-print(report.run_suite(FiniteDifferenceOracle(t=1e-6)))
+print(report.run_suite(
+    differentiator=FiniteDifferenceOracle(t=1e-6),
+    names=NAMES
+))
 
 # --------------------------------------------------------------------------
 rule("2b. the unregularised baseline on the same problems")
-print(report.run_suite(IFT(mode="active_set")))
+print(report.run_suite(
+    differentiator=IFT(mode="active_set"),
+    names=NAMES
+))
 
 raise Exception
 
