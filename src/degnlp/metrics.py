@@ -145,8 +145,8 @@ def hoelder(
     """
     Computes the observed Hölder exponent of the solution mapping.
     
-    This function tracks the distance $\|\phi(\bar{\theta} + t d) - \bar{\phi}\|$ 
-    as $t \to 0$ and fits a line in log-log space to find the exponent $p$ such 
+    This function tracks the distance $\\|\\phi(\\bar{\\theta} + t d) - \\bar{\\phi}\\|$ 
+    as $t \\to 0$ and fits a line in log-log space to find the exponent $p$ such 
     that the distance is proportional to $t^p$.
 
     Args:
@@ -271,7 +271,7 @@ def taylor(
     noise_floor: float = 1e-13,
 ) -> Taylor:
     """
-    Compares the first-order Taylor prediction $\bar{\phi} + t J d$ against the true solution.
+    Compares the first-order Taylor prediction $\\bar{\\phi} + t J d$ against the true solution.
 
     This acts as a robust numerical derivative test. It calculates:
       - The true displacement of the solution.
