@@ -29,21 +29,18 @@ DEFAULT_TS = np.geomspace(1e-1, 1e-6, 13)
 TINY = 1e-300
 
 
-# ---------------------------------------------------------------------------
-# TODO: what is this?
 def _dir(example: Example, direction) -> Tuple[str, np.ndarray]:
+    # if no direction is passed, pass next direction from example
     if direction is None:
         name = next(iter(example.directions))
         return name, example.direction(name)
+    # if string is passed, look for a direction with that name
     if isinstance(direction, str):
         return direction, example.direction(direction)
+    # otherwise, we are dealing with a custom direction (given numerically)
+    # and we normalize it first.
     d = np.atleast_1d(np.asarray(direction, dtype=float))
     return "<custom>", d / max(np.linalg.norm(d), TINY)
-
-# TODO: this is definitely not needed
-def residual_at(example: Example, phi: np.ndarray, theta: np.ndarray) -> float:
-    """||KKT residual|| of an arbitrary primal-dual vector, via ``funcs.kkt``."""
-    return example.residual_phi(phi, theta)
 
 
 @dataclass
@@ -101,6 +98,7 @@ class Hoelder:
             elif not np.isfinite(exp):
                 out[s] = self.exists[s] and not np.isfinite(self.exponent[s])
             else:
+                assert not isinstance(exp,str)
                 out[s] = self.exists[s] and abs(self.exponent[s] - exp) < 0.08
         return out
 
@@ -379,11 +377,11 @@ def step_residual(
     for t in ts:
         for s in (+1.0, -1.0):
             theta = example.theta_bar + s * t * d
-            r0 = residual_at(example, phibar, theta)
-            r1 = residual_at(example, phibar + J @ (s * t * d), theta)
+            r0 = example.residual_phi(phibar, theta)
+            r1 = example.residual_phi(phibar + J @ (s * t * d), theta)
             points = example.solve(theta)
             rt = (
-                example.residual_phi(phi_np(select_branch(points, phibar, dim, kind=kind)), theta)
+                example.residual_phi(phi_np(select_branch(points, phibar, dim, kind=kind)), theta) # type: ignore
                 if points else np.nan
             )
             tab.rows.append({"t": float(t), "sign": "+" if s > 0 else "-",
