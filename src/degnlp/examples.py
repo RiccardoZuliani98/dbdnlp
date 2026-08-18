@@ -12,7 +12,7 @@ Conventions:  L = f + lam^T g + nu^T h,  g <= 0,  lam >= 0.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, cast
 
 import casadi as ca
 import numpy as np
@@ -49,8 +49,8 @@ def fold() -> Example:
     1/varrho at theta = 0, bias -varrho/2, fold displaced to theta = -varrho^2/4.
     """
 
-    x = ca.SX.sym("x", 1)
-    th = ca.SX.sym("theta", 1)
+    x = cast(ca.SX, ca.SX.sym("x", 1)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 1)) # type: ignore
     nlp = DifferentiableNLP(x, th, x[0] ** 3 / 3 - th[0] * x[0])
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
@@ -96,8 +96,8 @@ def cusp() -> Example:
     rather than a translation.
     """
 
-    x = ca.SX.sym("x", 1)
-    th = ca.SX.sym("theta", 1)
+    x = cast(ca.SX, ca.SX.sym("x", 1)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 1)) # type: ignore
     nlp = DifferentiableNLP(x, th, x[0] ** 4 / 4 - th[0] * x[0])
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
@@ -139,8 +139,8 @@ def pitchfork() -> Example:
     bifurcation to theta = varrho.
     """
 
-    x = ca.SX.sym("x", 1)
-    th = ca.SX.sym("theta", 1)
+    x = cast(ca.SX, ca.SX.sym("x", 1)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 1)) # type: ignore
     nlp = DifferentiableNLP(x, th, x[0] ** 4 / 4 - th[0] * x[0] ** 2 / 2)
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
@@ -178,8 +178,8 @@ def swallowtail() -> Example:
     genuinely transverse directions to cover.
     """
 
-    x = ca.SX.sym("x", 1)
-    th = ca.SX.sym("theta", 2)
+    x = cast(ca.SX, ca.SX.sym("x", 1)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 2)) # type: ignore
     nlp = DifferentiableNLP(x, th, x[0] ** 4 / 4 - th[0] * x[0] ** 2 / 2 - th[1] * x[0])
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
@@ -232,8 +232,8 @@ def mixed_kernel(b: float = 1.0, c: float = 1.0, name: Optional[str] = None) -> 
                  dx1/dtheta = 1 / (1 + rho(1 + varrho) - rho b^2 / varrho).
     """
 
-    x = ca.SX.sym("x", 2)
-    th = ca.SX.sym("theta", 1)
+    x = cast(ca.SX, ca.SX.sym("x", 2)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 1)) # type: ignore
     f = 0.5 * x[0] ** 2 + b * x[0] * x[1] + (c / 6.0) * x[1] ** 3
     nlp = DifferentiableNLP(x, th, f, h=ca.vertcat(x[0] - th[0]))
 
@@ -308,8 +308,8 @@ def licq_two_eq() -> Example:
             x_reg = (theta1 + theta2) / (2 + rho(1 + varrho)).
     """
 
-    x = ca.SX.sym("x", 1)
-    th = ca.SX.sym("theta", 2)
+    x = cast(ca.SX, ca.SX.sym("x", 1)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 2)) # type: ignore
     nlp = DifferentiableNLP(
         x, th, 0.5 * x[0] ** 2, h=ca.vertcat(x[0] - th[0], x[0] - th[1])
     )
@@ -381,8 +381,8 @@ def tangency(kappa: float = 0.5, multiplier: Optional[float] = None) -> Example:
     """
     lam1_bar = kappa / 2.0 if multiplier is None else multiplier
 
-    x = ca.SX.sym("x", 2)
-    th = ca.SX.sym("theta", 1)
+    x = cast(ca.SX, ca.SX.sym("x", 2)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 1)) # type: ignore
     f = -x[1] - 0.5 * kappa * x[0] ** 2
     g = ca.vertcat(x[0] ** 2 + (x[1] - 1.0) ** 2 - 1.0, x[1] - 2.0 - th[0])
     nlp = DifferentiableNLP(x, th, f, g=g)
@@ -439,8 +439,8 @@ def wachter_biegler() -> Example:
     reported here is regularisation bias or a bug, not degeneracy.
     """
 
-    x = ca.SX.sym("x", 3)
-    th = ca.SX.sym("theta", 2)
+    x = cast(ca.SX, ca.SX.sym("x", 3)) # type: ignore
+    th = cast(ca.SX, ca.SX.sym("theta", 2)) # type: ignore
     g = ca.vertcat(-x[1], -x[2])
     h = ca.vertcat(x[0] ** 2 - x[1] - 1.0 - th[0], x[0] - x[2] - 0.5 - th[1])
     nlp = DifferentiableNLP(x, th, x[0], g=g, h=h)
