@@ -1,101 +1,71 @@
 """
 Baseline differentiators.
 
-Signature matches :class:`degnlp.types.Differentiator`::
+All three satisfy :class:`degnlp.types.Differentiator`::
 
-    (nlp, solution: NLPSolution) -> d phi / d theta      (n_phi, n_theta)
+    (nlp, solution: NLPSolution) -> d phi / d theta
 
-They exist so the harness can be validated and so you have something to plot
-against.  They are deliberately *not* a model of P2: the system below is the
-plain ``K + diag(varrho I, -rho I)``, with no slack variable ``z`` and no
-theta-dependent proximal centre ``g_theta(xbar)``.  Everything is read off
-``nlp.funcs.ift``, so they work against a ``DifferentiableNLP`` or the
-``ReferenceNLP`` fallback without modification.
+The first two are thin adapters over ``DifferentiableNLP.differentiate``: they
+add no mathematics, they only turn the ``(theta, x, lam, nu, mode, options)``
+signature into the ``(nlp, solution)`` one the harness iterates over, so a suite
+run compares *your* modes against each other rather than against a
+reimplementation.  The returned ``{'x', 'lam', 'nu'}`` dict is passed through
+untouched -- it is already the contract.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import numpy as np
 
-from .adapter import active_set, kkt_matrix
-from .core import Dims, phi_np, select_branch
-from .types import ArrayLike, NLPSolution, to_np
+from .core import phi_np, select_branch
+from .types import NLPSolution, Sensitivities
 
 
 @dataclass
-class RegularizedKKT:
-    """dphi/dtheta from the regularised, active-set-frozen KKT system.
+class IFT:
+    """``differentiate(mode='full')`` or ``mode='active_set'``.
 
-        [ H_xx + varrho I   J_A^T   J_h^T ] [ dx     ]     [ H_xtheta ]
-        [ J_A              -rho I     0   ] [ dlam_A ] = - [ J_Atheta ]
-        [ J_h                0     -rho I ] [ dnu    ]     [ J_htheta ]
-
-    ``cond`` is recorded after each call so the varrho/rho ratio trap is visible.
+    The unregularised implicit-function derivative.  On a degenerate example the
+    linear system is singular, so this either raises or returns nonsense -- which
+    is precisely the baseline the regularisation has to beat.  ``run_suite``
+    records a raised exception as a note rather than crashing.
     """
 
-    varrho: float = 1e-3
-    rho: float = 1e-3
-    active_tol: float = 1e-8
-    name: str = "reg-kkt"
-    cond: Optional[float] = None
-    active: Optional[np.ndarray] = None
+    mode: str = "active_set"
+    options: Optional[Dict[str, Any]] = None
+    name: str = ""
 
-    def __call__(self, nlp, solution: NLPSolution) -> ArrayLike:
-        n_theta = int(to_np(solution.theta).size)
-        dims = Dims.from_nlp(nlp, n_theta=n_theta)
-        act = active_set(nlp, solution, tol=self.active_tol)
-        self.active = act
-        K, rhs = kkt_matrix(
-            nlp, solution, varrho=self.varrho, rho=self.rho, active=act, n_theta=n_theta
+    def __post_init__(self):
+        self.name = self.name or f"ift-{self.mode}"
+
+    def __call__(self, nlp, solution: NLPSolution) -> Sensitivities:
+        return nlp.differentiate(
+            solution.theta, solution.x, solution.lam, solution.nu,
+            mode=self.mode, options=self.options,
         )
-        self.cond = float(np.linalg.cond(K)) if K.shape[0] else float("nan")
-        try:
-            sol = np.linalg.solve(K, rhs)
-        except np.linalg.LinAlgError:
-            sol = np.linalg.lstsq(K, rhs, rcond=None)[0]
-
-        n_x, na, n_eq = dims.n_x, int(act.sum()), dims.n_eq
-        J = np.zeros((dims.n_phi, n_theta))
-        J[dims.blocks["x"]] = sol[:n_x]
-        if na:
-            J[np.where(act)[0] + n_x] = sol[n_x : n_x + na]
-        if n_eq:
-            J[dims.blocks["nu"]] = sol[n_x + na :]
-        return J
 
 
 @dataclass
-class PseudoInverseKKT(RegularizedKKT):
-    """The unregularised system with a least-squares fallback.
+class Regularized:
+    """``differentiate(mode='regularized')`` at fixed ``(rho_1, rho_2)``.
 
-    What you get if you ignore the degeneracy and let the linear solver cope: a
-    plausible-looking matrix that is wrong in a specific, diagnosable way.
+    ``rho_1`` is the primal weight (``varrho`` in the write-up), ``rho_2`` the
+    dual one.  Sweeping ``rho_1/rho_2`` along a mixed kernel direction is what
+    exposes the ratio trap.
     """
 
-    varrho: float = 0.0
-    rho: float = 0.0
-    name: str = "pinv-kkt"
+    rho_1: float = 1e-3
+    rho_2: float = 1e-3
+    name: str = "regularized"
 
-    def __call__(self, nlp, solution: NLPSolution) -> ArrayLike:
-        self.varrho, self.rho = 0.0, 0.0
-        n_theta = int(to_np(solution.theta).size)
-        dims = Dims.from_nlp(nlp, n_theta=n_theta)
-        act = active_set(nlp, solution, tol=self.active_tol)
-        self.active = act
-        K, rhs = kkt_matrix(nlp, solution, active=act, n_theta=n_theta)
-        self.cond = float(np.linalg.cond(K)) if K.shape[0] else float("nan")
-        sol = np.linalg.lstsq(K, rhs, rcond=None)[0]
-        n_x, na, n_eq = dims.n_x, int(act.sum()), dims.n_eq
-        J = np.zeros((dims.n_phi, n_theta))
-        J[dims.blocks["x"]] = sol[:n_x]
-        if na:
-            J[np.where(act)[0] + n_x] = sol[n_x : n_x + na]
-        if n_eq:
-            J[dims.blocks["nu"]] = sol[n_x + na :]
-        return J
+    def __call__(self, nlp, solution: NLPSolution) -> Sensitivities:
+        return nlp.differentiate(
+            solution.theta, solution.x, solution.lam, solution.nu,
+            mode="regularized", options={"rho_1": self.rho_1, "rho_2": self.rho_2},
+        )
 
 
 @dataclass
@@ -103,8 +73,9 @@ class FiniteDifferenceOracle:
     """Central (or one-sided) difference of the *true* solution map.
 
     A positive control: on nondegenerate examples the harness must certify this
-    as second order.  Needs the example itself, not just ``(nlp, solution)``, so
-    it is constructed per example via :meth:`bind`.
+    as second order.  Needs the example's analytic branches rather than just
+    ``(nlp, solution)``, so it is bound per example via :meth:`bind`;
+    ``report.jacobian_for`` does that automatically.
     """
 
     example: object = None
@@ -115,12 +86,11 @@ class FiniteDifferenceOracle:
     def bind(self, example) -> "FiniteDifferenceOracle":
         return FiniteDifferenceOracle(example=example, t=self.t, kind=self.kind)
 
-    def __call__(self, nlp, solution: NLPSolution) -> ArrayLike:
+    def __call__(self, nlp, solution: NLPSolution) -> Sensitivities:
         ex = self.example
         if ex is None:
             raise ValueError("FiniteDifferenceOracle must be bound to an example")
-        dims = ex.dims
-        phibar = ex.phi_bar_np
+        dims, phibar = ex.dims, ex.phi_bar_np
         J = np.full((dims.n_phi, dims.n_theta), np.nan)
         for j in range(dims.n_theta):
             e = np.zeros(dims.n_theta)
@@ -135,4 +105,5 @@ class FiniteDifferenceOracle:
                 J[:, j] = 0.5 * (sides["+"] + sides["-"])
             elif sides:
                 J[:, j] = next(iter(sides.values()))
-        return J
+        # NaN columns mean "no solution on either side", which is a real answer
+        return {k: J[dims.blocks[k]] for k in ("x", "lam", "nu")}

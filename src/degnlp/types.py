@@ -1,64 +1,35 @@
 """
 Types.
 
-The codebase types (``NLPSolution``, ``NLPSymbolic``, ``NLPFunctions``,
-``Symbolic``, ``ArrayLike`` and the function-signature annotations) are imported
-from your package when it is importable, and from a vendored copy of
-``types.py`` otherwise.  Edit ``_CANDIDATES`` so there is a single source of
-truth once this lives inside the project.
+Everything structural comes from the project: ``NLPSolution``, ``NLPSymbolic``,
+``NLPFunctions`` and the function-signature annotations are re-exported from
+``dbdnlp._impl.types`` so there is exactly one definition of each.
 
-Everything defined *here* is additive: ``ca.DM``/``np.ndarray`` conversion
-helpers and the differentiator protocol the harness talks to.
+Defined here: ``ca.DM`` <-> ``numpy`` conversion helpers used by the harness, and
+the differentiator protocol.
 """
 
 from __future__ import annotations
 
-import importlib
-from typing import Dict, Optional, Protocol, Tuple, Union, runtime_checkable
+from typing import Dict, Optional, Protocol, Tuple, runtime_checkable
 
 import casadi as ca
 import numpy as np
 
-_CANDIDATES = (
-    "dbdnlp._impl.types",   # <- the real one; adjust to match your layout
-    "dbdnlp.types",
+from dbdnlp._impl.types import (  # noqa: F401
+    ArrayLike,
+    CostFuncType,
+    CstFuncType,
+    EqFuncType,
+    IFTFuncType,
+    IneqFuncType,
+    KKTFuncType,
+    LagrFuncType,
+    NLPFunctions,
+    NLPSolution,
+    NLPSymbolic,
+    Symbolic,
 )
-
-_NAMES = (
-    "Symbolic",
-    "ArrayLike",
-    "NLPSolution",
-    "NLPSymbolic",
-    "NLPFunctions",
-    "CostFuncType",
-    "IneqFuncType",
-    "EqFuncType",
-    "CstFuncType",
-    "LagrFuncType",
-    "KKTFuncType",
-    "IFTFuncType",
-)
-
-_module = None
-for _cand in _CANDIDATES:
-    try:
-        _module = importlib.import_module(_cand)
-        break
-    except ImportError:
-        continue
-if _module is None:
-    from . import _types_vendored as _module  # vendored fallback
-
-TYPES_SOURCE = _module.__name__
-
-globals().update({name: getattr(_module, name) for name in _NAMES})
-
-# re-bound explicitly so static tooling and ``from .types import X`` both work
-Symbolic = _module.Symbolic
-ArrayLike = _module.ArrayLike
-NLPSolution = _module.NLPSolution
-NLPSymbolic = _module.NLPSymbolic
-NLPFunctions = _module.NLPFunctions
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +38,7 @@ NLPFunctions = _module.NLPFunctions
 def to_np(value, shape: Optional[Tuple[int, ...]] = None) -> np.ndarray:
     """Flatten a ``ca.DM`` / ``np.ndarray`` / scalar to a numpy array."""
     if isinstance(value, (ca.DM, ca.SX, ca.MX)):
-        arr = np.array(ca.DM(value), dtype=float)
+        arr = np.array(ca.DM(value).full(), dtype=float)
     else:
         arr = np.asarray(value, dtype=float)
     if shape is not None:
@@ -77,60 +48,54 @@ def to_np(value, shape: Optional[Tuple[int, ...]] = None) -> np.ndarray:
     return arr
 
 
-def to_dm(value, n_rows: Optional[int] = None) -> ca.DM:
-    """Build a column ``ca.DM``, handling the zero-size case cleanly.
-
-    CasADi will not accept ``np.zeros(0)`` where a ``(0, 1)`` input is expected,
-    which every unconstrained example hits on the ``lam``/``nu`` arguments.
-    """
-    if isinstance(value, ca.DM):
-        arr = np.array(value, dtype=float).reshape(-1)
-    else:
-        arr = np.atleast_1d(np.asarray(value, dtype=float)).reshape(-1)
-    if n_rows is not None:
-        if arr.size == 0 or n_rows == 0:
-            return ca.DM(n_rows, 1)
-        arr = arr.reshape(n_rows)
-    if arr.size == 0:
-        return ca.DM(0, 1)
-    return ca.DM(arr.reshape(-1, 1))
-
-
 def mat(value, rows: int, cols: int) -> np.ndarray:
     """Coerce a possibly zero-size CasADi output to an exact ``(rows, cols)`` array."""
-    arr = value if isinstance(value, np.ndarray) else np.array(ca.DM(value), dtype=float)
-    if arr.size == 0:
-        return np.zeros((rows, cols))
-    return arr.reshape(rows, cols)
+    arr = value if isinstance(value, np.ndarray) else np.array(ca.DM(value).full(), dtype=float)
+    return np.zeros((rows, cols)) if arr.size == 0 else arr.reshape(rows, cols)
 
 
 # ---------------------------------------------------------------------------
 # what the harness asks of a differentiator
 # ---------------------------------------------------------------------------
-JacLike = Union[np.ndarray, ca.DM, Dict[str, "ArrayLike"], object]
+#: The return type of ``DifferentiableNLP.differentiate``: sensitivity blocks
+#: keyed by ``'x'``, ``'lam'``, ``'nu'``, of shapes ``(n_x, n_theta)``,
+#: ``(n_ineq, n_theta)``, ``(n_eq, n_theta)``.
+Sensitivities = Dict[str, ArrayLike]
 
 
 @runtime_checkable
 class Differentiator(Protocol):
-    """``(nlp, solution) -> d phi / d theta`` of shape ``(n_phi, n_theta)``.
+    """``(nlp, solution) -> Sensitivities``.
 
-    ``coerce_jac`` also accepts an ``(n_x, n_theta)`` block, a dict keyed by
-    ``x`` / ``lam`` / ``nu``, a ``ca.DM``, or an object exposing ``.jac`` /
-    ``.jacobian`` / ``.J``.  Unreported rows stay unreported rather than
-    silently becoming zero.
+    Deliberately the exact signature and return type of
+    ``DifferentiableNLP.differentiate``, modulo currying the mode and options,
+    so writing an adapter is never necessary.  All three blocks are required:
+    anything a differentiator cannot compute it reports as NaN, so that a
+    missing sensitivity is visible in the results rather than indistinguishable
+    from a true zero.
     """
 
     name: str
 
-    def __call__(self, nlp, solution: "NLPSolution") -> ArrayLike:
+    def __call__(self, nlp, solution: NLPSolution) -> Sensitivities:
         ...
 
 
-__all__ = list(_NAMES) + [
-    "TYPES_SOURCE",
+__all__ = [
+    "ArrayLike",
+    "CostFuncType",
+    "CstFuncType",
+    "EqFuncType",
+    "IFTFuncType",
+    "IneqFuncType",
+    "KKTFuncType",
+    "LagrFuncType",
+    "NLPFunctions",
+    "NLPSolution",
+    "NLPSymbolic",
+    "Symbolic",
     "Differentiator",
-    "JacLike",
+    "Sensitivities",
     "to_np",
-    "to_dm",
     "mat",
 ]

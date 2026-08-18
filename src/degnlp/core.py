@@ -3,19 +3,24 @@ Core datatypes for the degenerate-NLP test library.
 
 Design contract
 ---------------
-The *examples* know everything about the mathematics of P1: the functions
-``f, g, h``, a reference (possibly degenerate) primal-dual point, and -- where
-it exists in closed form -- the exact set of nearby KKT points as a function of
-theta.  Every solution is an ``NLPSolution``; the second-order character of a
-branch lives in ``properties['kind']``.
+The *examples* know everything about the mathematics of P1: the CasADi
+description handed to ``DifferentiableNLP``, a reference (possibly degenerate)
+primal-dual point, and -- where it exists in closed form -- the exact set of
+nearby KKT points as a function of theta.  Every solution is an ``NLPSolution``
+built by ``DifferentiableNLP.evaluate``; the second-order character of a branch
+lives in ``properties['kind']``.
 
 The *harness* (``metrics.py``) knows nothing about how a derivative was
-obtained.  Every check consumes a plain numeric Jacobian
+obtained.  A differentiator is any callable
 
-    J  ~  d phi / d theta      of shape (n_x + n_ineq + n_eq, n_theta)
+    (nlp, solution: NLPSolution) -> {'x': (n_x, n_theta),
+                                     'lam': (n_ineq, n_theta),
+                                     'nu': (n_eq, n_theta)}
 
-(or a subset of its rows, see ``coerce_jac``).  Swapping differentiators means
-handing the harness a different array.
+which is exactly what ``DifferentiableNLP.differentiate`` returns.  All three
+keys are required; ``stack_sensitivities`` is the only thing the harness does
+with them.  Anything a differentiator cannot compute it must report as NaN --
+never as a silent zero, and never by omitting the block.
 
 Sign conventions:  L = f + lam^T g + nu^T h,  g(x, theta) <= 0,  lam >= 0.
 """
@@ -23,20 +28,14 @@ Sign conventions:  L = f + lam^T g + nu^T h,  g(x, theta) <= 0,  lam >= 0.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import casadi as ca
 import numpy as np
 
-from .adapter import (
-    Builder,
-    eval_kkt,
-    kernel_basis,
-    make_nlp,
-    residual_norm,
-    solution_properties,
-)
-from .types import JacLike, NLPSolution, to_dm, to_np
+from dbdnlp._impl.nlp import DifferentiableNLP
+
+from .types import NLPSolution, Sensitivities, mat, to_np
+
 
 Array = np.ndarray
 
@@ -46,7 +45,7 @@ Array = np.ndarray
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Dims:
-    """Sizes of one parametric NLP, named as in ``NLPSolution``."""
+    """Block structure of ``NLPSolution.phi``, read off the NLP."""
 
     n_x: int
     n_ineq: int = 0
@@ -54,15 +53,8 @@ class Dims:
     n_theta: int = 1
 
     @classmethod
-    def from_nlp(cls, nlp, n_theta: Optional[int] = None) -> "Dims":
-        n_th = getattr(nlp, "n_theta", None) if n_theta is None else n_theta
-        if n_th is None:
-            n_th = int(nlp.sym.param.numel())
-        return cls(int(nlp.n_x), int(nlp.n_ineq), int(nlp.n_eq), int(n_th))
-
-    @property
-    def n_c(self) -> int:
-        return self.n_ineq + self.n_eq
+    def of(cls, nlp) -> "Dims":
+        return cls(int(nlp.n_x), int(nlp.n_ineq), int(nlp.n_eq), int(nlp.n_theta))
 
     @property
     def n_phi(self) -> int:
@@ -83,69 +75,6 @@ class Dims:
             raise KeyError(f"unknown block {block!r}; use one of {sorted(self.blocks)}")
         return np.asarray(arr, dtype=float)[self.blocks[block]]
 
-    def stack(self, x, lam=None, nu=None) -> Array:
-        return np.concatenate(
-            [
-                to_np(x).reshape(self.n_x),
-                np.zeros(self.n_ineq) if lam is None else to_np(lam).reshape(self.n_ineq),
-                np.zeros(self.n_eq) if nu is None else to_np(nu).reshape(self.n_eq),
-            ]
-        )
-
-
-# ---------------------------------------------------------------------------
-# solutions
-# ---------------------------------------------------------------------------
-def phi_np(solution: NLPSolution) -> Array:
-    """``solution.phi`` (a ``ca.DM``) as a flat numpy array."""
-    return to_np(solution.phi).reshape(-1)
-
-
-def kind_of(solution: NLPSolution) -> str:
-    """Second-order character of a branch: ``'min'``, ``'saddle'``, ``'max'``,
-    ``'degenerate'``, ``'reference'`` or ``'unknown'``.
-
-    Stored in ``properties`` because ``NLPSolution`` has one slot for
-    solution-level metadata and the label is not boolean.
-    """
-    props = solution.properties or {}
-    return str(props.get("kind", "unknown"))
-
-
-def make_solution(
-    nlp,
-    theta,
-    x,
-    lam=None,
-    nu=None,
-    kind: str = "unknown",
-    with_properties: bool = False,
-    **meta: Any,
-) -> NLPSolution:
-    """Build an :class:`NLPSolution` with its KKT residuals filled in.
-
-    ``kind`` and any extra keywords land in ``properties``; passing
-    ``with_properties=True`` additionally runs the LICQ / SOSC / strict
-    complementarity analysis, which costs an extra ``ift`` evaluation.
-    """
-    n_x, n_ineq, n_eq = int(nlp.n_x), int(nlp.n_ineq), int(nlp.n_eq)
-    xd, lamd, nud = to_dm(x, n_x), to_dm(lam if lam is not None else [], n_ineq), to_dm(
-        nu if nu is not None else [], n_eq
-    )
-    thd = to_dm(theta)
-    sol = NLPSolution(
-        x=xd,
-        theta=thd,
-        lam=lamd,
-        nu=nud,
-        kkt_residuals=eval_kkt(nlp, xd, lamd, nud, thd),
-        properties={"kind": kind, **meta},
-    )
-    if with_properties:
-        sol.properties.update(solution_properties(nlp, sol))
-    return sol
-
-
 # ---------------------------------------------------------------------------
 # the example container
 # ---------------------------------------------------------------------------
@@ -155,8 +84,7 @@ class Example:
 
     name: str
     tags: Tuple[str, ...]
-    #: CasADi builder, ``() -> (primal, param, cost, ineq, eq)``
-    build: Builder
+    nlp: DifferentiableNLP
     theta_bar: Array
     #: reference primal-dual point at ``theta_bar`` as ``(x, lam, nu)``
     reference: Tuple[Sequence[float], Sequence[float], Sequence[float]]
@@ -169,21 +97,12 @@ class Example:
     #: analytic Lyapunov-Schmidt data / closed forms, free-form
     ls: Dict[str, object] = field(default_factory=dict)
     notes: str = ""
-
-    _nlp: Optional[object] = None
-
-    # -- the NLP object ----------------------------------------------------
-    @property
-    def nlp(self):
-        """The ``DifferentiableNLP`` (or ``ReferenceNLP``) for this example,
-        built once through ``adapter.NLP_FACTORY``."""
-        if self._nlp is None:
-            self._nlp = make_nlp(self.build)
-        return self._nlp
+    
+    _phi_bar: Optional[NLPSolution] = None
 
     @property
     def dims(self) -> Dims:
-        return Dims.from_nlp(self.nlp, n_theta=self.p)
+        return Dims.of(self.nlp)
 
     @property
     def p(self) -> int:
@@ -191,36 +110,41 @@ class Example:
 
     # -- solutions ---------------------------------------------------------
     def at(self, theta, x, lam=None, nu=None, kind: str = "unknown", **meta) -> NLPSolution:
-        return make_solution(self.nlp, theta, x, lam, nu, kind=kind, **meta)
+        """One KKT point as an ``NLPSolution``, residuals evaluated by CasADi."""
+        return self.nlp.evaluate(theta, x, lam, nu, properties={"kind": kind, **meta})
 
     def solve(self, theta: Array, with_properties: bool = False) -> List[NLPSolution]:
-        """Every nearby KKT point at ``theta``, analytically."""
+        """Every nearby KKT point at ``theta``, analytically -- no solver call."""
+        
+        # ensure proper type in theta
         theta = np.atleast_1d(np.asarray(theta, dtype=float))
 
+        # fix theta value in "at" method
         def at(x, lam=None, nu=None, kind: str = "unknown", **meta) -> NLPSolution:
             return self.at(theta, x, lam, nu, kind=kind, **meta)
 
+        # compute explicit solution using "branches"
         out = list(self.branches(theta, at))
+
+        # annotate if requested
         if with_properties:
             for s in out:
-                s.properties.update(solution_properties(self.nlp, s))
+                self.nlp.annotate_solution(s)
         return out
-
-    def solve_at(self, theta: Array) -> List[NLPSolution]:
-        return self.solve(theta)
 
     @property
     def phi_bar(self) -> NLPSolution:
-        """Reference solution at ``theta_bar``, with its properties analysed."""
-        x, lam, nu = self.reference
-        return make_solution(
-            self.nlp, self.theta_bar, x, lam, nu, kind="reference", with_properties=True
-        )
+        """Reference solution at ``theta_bar``, annotated by ``check_properties``."""
+        if self._phi_bar is None:
+            x, lam, nu = self.reference
+            sol = self.at(self.theta_bar, x, lam, nu, kind="reference")
+            self.nlp.annotate_solution(sol)
+            self._phi_bar = sol
+        return self._phi_bar
 
     @property
     def phi_bar_np(self) -> Array:
-        x, lam, nu = self.reference
-        return self.dims.stack(x, lam, nu)
+        return phi_np(self.phi_bar)
 
     # -- helpers -----------------------------------------------------------
     def direction(self, name: Optional[str] = None) -> Array:
@@ -240,13 +164,20 @@ class Example:
             cols.append(col / np.linalg.norm(col) if normalise else col)
         return np.stack(cols, axis=1)
 
-    def kernel_numeric(self, tol: float = 1e-8) -> Array:
-        """``ker K`` measured from ``funcs.ift`` at the reference point."""
-        return kernel_basis(self.nlp, self.phi_bar, tol=tol)
-
     def residual(self, x, lam, nu, theta) -> float:
         """Scalar KKT residual norm, evaluated exactly by CasADi."""
-        return residual_norm(eval_kkt(self.nlp, x, lam, nu, theta))
+
+        # evaluate solution
+        solution = self.nlp.evaluate(theta, x, lam, nu)
+
+        # convert to list of np arrays
+        parts = [to_np(v).reshape(-1) for v in solution.kkt_residuals.values()]
+
+        # normalize zero vectors
+        parts = [p for p in parts if p.size] or [np.zeros(1)]
+
+        # compute combined norm
+        return float(np.linalg.norm(np.concatenate(parts)))
 
     def residual_phi(self, phi: Array, theta) -> float:
         d = self.dims
@@ -258,48 +189,9 @@ class Example:
 
 
 # ---------------------------------------------------------------------------
-# Jacobian coercion + branch selection
+# branch selection
 # ---------------------------------------------------------------------------
-def coerce_jac(jac: JacLike, dims: Dims) -> Array:
-    """Normalise whatever a differentiator returned into an ``(n_phi, n_theta)`` array.
-
-    Accepts
-      * a full ``(n_phi, n_theta)`` array or ``ca.DM``,
-      * an ``(n_x, n_theta)`` array -> the x-block, duals left unreported,
-      * a dict with any of the keys ``x``, ``lam``, ``nu``,
-      * any object exposing ``.jac`` / ``.jacobian`` / ``.J`` with the above.
-
-    Unreported rows are NaN and are *skipped* by the metrics, so a
-    differentiator that only produces dx/dtheta stays fully testable on the
-    primal block.
-    """
-    for attr in ("jac", "jacobian", "J"):
-        if not isinstance(jac, (np.ndarray, ca.DM, dict)) and hasattr(jac, attr):
-            jac = getattr(jac, attr)
-            break
-
-    out = np.full((dims.n_phi, dims.n_theta), np.nan)
-    if isinstance(jac, dict):
-        for key, blk in jac.items():
-            sl = dims.blocks[key]
-            out[sl] = to_np(blk).reshape(sl.stop - sl.start, dims.n_theta)
-        return out
-
-    # note: np.array(ca.DM(...)) rather than to_np, which flattens (1, n) matrices
-    arr = np.array(ca.DM(jac), dtype=float) if isinstance(jac, ca.DM) else np.asarray(jac, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    if arr.shape == (dims.n_phi, dims.n_theta):
-        return arr
-    if arr.shape == (dims.n_x, dims.n_theta):
-        out[dims.blocks["x"]] = arr
-        return out
-    raise ValueError(
-        f"cannot interpret Jacobian of shape {arr.shape}; expected "
-        f"({dims.n_phi}, {dims.n_theta}) or ({dims.n_x}, {dims.n_theta})"
-    )
-
-
+# TODO: this function and the next should be merged into one
 def select_branch(
     branches: Sequence[NLPSolution],
     reference: Array,
@@ -331,10 +223,7 @@ def distance_to_set(
     pt = dims.rows(np.asarray(point, dtype=float), block)
     return float(min(np.linalg.norm(dims.rows(phi_np(b), block) - pt) for b in pool))
 
-
-# ---------------------------------------------------------------------------
-# small numerics
-# ---------------------------------------------------------------------------
+#TODO: I don't understand this function
 def loglog_slope(xs: Sequence[float], ys: Sequence[float], last: Optional[int] = None) -> float:
     """Least-squares slope of log y vs log x over the finite, positive entries.
 
@@ -354,6 +243,45 @@ def loglog_slope(xs: Sequence[float], ys: Sequence[float], last: Optional[int] =
     sol, *_ = np.linalg.lstsq(A, np.log(ys[ok]), rcond=None)
     return float(sol[0])
 
+# ---------------------------------------------------------------------------
+# conversion helpers
+# ---------------------------------------------------------------------------
+def phi_np(solution: NLPSolution) -> Array:
+    """``solution.phi`` (a ``ca.DM``) as a flat numpy array."""
+    return to_np(solution.phi).reshape(-1)
 
-def geomspace(lo: float, hi: float, num: int) -> Array:
-    return np.geomspace(lo, hi, num)
+
+def kind_of(solution: NLPSolution) -> str:
+    """Second-order character of a branch: ``'min'``, ``'saddle'``, ``'max'``,
+    ``'degenerate'``, ``'reference'`` or ``'unknown'``.
+
+    Kept in ``properties`` because ``NLPSolution`` has one slot for
+    solution-level metadata and this label is not boolean.
+    """
+    return str((solution.properties or {}).get("kind", "unknown"))
+
+def stack_sensitivities(sens: Sensitivities, dims: Dims) -> Array:
+    """``{'x', 'lam', 'nu'} -> (n_phi, n_theta)``, in ``phi`` order.
+
+    The entire interface between the harness and a differentiator.  A missing
+    key or a wrongly shaped block raises here rather than being papered over,
+    which is the point: a differentiator that cannot fill a block should say so
+    with NaN.
+    """
+    if not isinstance(sens, dict):
+        raise TypeError(
+            "a differentiator must return {'x', 'lam', 'nu'} sensitivity blocks, "
+            f"as DifferentiableNLP.differentiate does; got {type(sens).__name__}"
+        )
+    missing = {"x", "lam", "nu"} - set(sens)
+    if missing:
+        raise KeyError(
+            f"differentiator must return 'x', 'lam' and 'nu'; missing {sorted(missing)}"
+        )
+    return np.vstack(
+        [
+            mat(sens["x"], dims.n_x, dims.n_theta),
+            mat(sens["lam"], dims.n_ineq, dims.n_theta),
+            mat(sens["nu"], dims.n_eq, dims.n_theta),
+        ]
+    )

@@ -204,25 +204,73 @@ class DifferentiableNLP:
         lam_opt = ca.DM(lam_c[:self.n_ineq])
         nu_opt  = ca.DM(lam_c[self.n_ineq:])
 
-        # Evaluate KKT residuals using the eagerly compiled function
-        stat, ineq, eq, slack, dual_feas = self.funcs.kkt(x_opt, lam_opt, nu_opt, theta_DM)
+        # Package the point and evaluate its KKT residuals
+        return self.evaluate(theta_DM, x_opt, lam_opt, nu_opt)
 
-        kkt_res = {
-            'stationarity':     stat,
-            'inequality':       ineq,
-            'equality':         eq,
-            'slackness':        slack,
-            'dual_feasibility': dual_feas
-        }
+    def evaluate(
+        self,
+        theta: ArrayLike,
+        x: ArrayLike,
+        lam: Optional[ArrayLike] = None,
+        nu: Optional[ArrayLike] = None,
+        properties: Optional[Dict[str, Any]] = None
+    ) -> NLPSolution:
+        """
+        Packages an arbitrary primal-dual point as an NLPSolution, evaluating its
+        KKT residuals. No solve is performed.
+
+        Useful for scoring a warmstart, wrapping a point obtained elsewhere
+        (an analytic solution, another solver), or re-checking a stored solution
+        at a new theta. `solve` uses it to build its return value.
+
+        Parameters
+        ----------
+        theta : ArrayLike
+            Parameter vector (n_theta, 1).
+        x : ArrayLike
+            Primal point (n_x, 1).
+        lam, nu : Optional[ArrayLike]
+            Multipliers (n_ineq, 1) and (n_eq, 1). None means zeros.
+        properties : Optional[Dict[str, Any]]
+            Initial contents of `NLPSolution.properties`.
+
+        Returns
+        -------
+        NLPSolution
+        """
+        theta_DM = ca.DM(theta)
+        x_DM     = self._col(x, self.n_x)
+        lam_DM   = self._col(lam, self.n_ineq)
+        nu_DM    = self._col(nu, self.n_eq)
+
+        stat, ineq, eq, slack, dual_feas = self.funcs.kkt(x_DM, lam_DM, nu_DM, theta_DM)
 
         return NLPSolution(
-            x=x_opt,
+            x=x_DM,
             theta=theta_DM,
-            lam=lam_opt,
-            nu=nu_opt,
-            kkt_residuals=kkt_res,
-            properties={},
+            lam=lam_DM,
+            nu=nu_DM,
+            kkt_residuals={
+                'stationarity':     ca.DM(stat),
+                'inequality':       ca.DM(ineq),
+                'equality':         ca.DM(eq),
+                'slackness':        ca.DM(slack),
+                'dual_feasibility': ca.DM(dual_feas)
+            },
+            properties=dict(properties) if properties else {},
         )
+
+    @staticmethod
+    def _col(v: Optional[ArrayLike], n: int) -> ca.DM:
+        """Length-n column DM; None or an empty input gives the (n, 1) zero vector."""
+        if v is None:
+            return ca.DM(n, 1)
+        d = ca.DM(v)
+        if d.numel() == 0:
+            return ca.DM(n, 1)
+        if d.numel() != n:
+            raise ValueError(f"expected {n} entries, got {d.numel()}")
+        return ca.reshape(d, n, 1)
 
     def differentiate(
         self,
@@ -455,8 +503,8 @@ class DifferentiableNLP:
         Returns
         -------
         Dict[str, Any]
-            licq, scs, sosc, ssosc (bool), plus diagnostics: n_active,
-            n_weakly_active, sosc_exact, and kkt_residual.
+            licq, scs, sosc, ssosc (bool), plus diagnostics: dim_kernel,
+            n_active, n_weakly_active, sosc_exact, and kkt_residual.
         """
         # --- 1. Reuse the eagerly compiled ift function -------------------------
         H_L_dm, _, J_g_dm, _, J_h_dm, _ = self.funcs.ift(x, lam, nu, theta)
@@ -520,12 +568,20 @@ class DifferentiableNLP:
         sosc = bool(ssosc or sosc_subspace)
         sosc_exact = bool(scs or ssosc)
 
+        # --- 7. Dimension of ker K, K = [[H_L, J_act^T], [J_act, 0]] ------------
+        # This is zero exactly when the IFT applies at this point, and its value
+        # counts the independent degeneracy directions (LICQ-type and SOSC-type
+        # together), which licq/sosc alone do not distinguish.
+        K = np.block([[H_L, J_act.T], [J_act, np.zeros((J_act.shape[0], J_act.shape[0]))]])
+        dim_kernel = int(K.shape[0] - np.linalg.matrix_rank(K, tol=rank_tol))
+
         return {
             "licq": licq,
             "scs": scs,
             "sosc": sosc,
             "ssosc": ssosc,
             "sosc_exact": sosc_exact,
+            "dim_kernel": dim_kernel,
             "n_active": int(active.size),
             "n_weakly_active": int(weak.size),
             "kkt_residual": kkt_res,
