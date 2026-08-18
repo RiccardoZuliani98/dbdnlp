@@ -11,7 +11,10 @@ still nothing structural.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Callable, Dict, List, Optional, 
+    Sequence, Tuple, cast
+)
 
 import numpy as np
 
@@ -201,9 +204,11 @@ def hoelder(
         else:
             expo[key] = loglog_slope([a for a, _ in pts], [b for _, b in pts], last=fit_last)
 
+    expected = dict(cast(dict, example.ls.get("expected", {})))
+
     return Hoelder(
         example=example.name, direction=name, block=block, exponent=expo, exists=exists,
-        expected=dict(example.ls.get("expected", {}).get(name, {})), table=tab,
+        expected=expected.get(name, {}), table=tab
     )
 
 
