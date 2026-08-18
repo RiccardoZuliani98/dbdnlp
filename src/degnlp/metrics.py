@@ -397,50 +397,77 @@ def taylor(
 # ---------------------------------------------------------------------------
 @dataclass
 class Asymmetry:
+    """Data object storing the results of the one-sided asymmetry check."""
     example: str
     direction: str
     t: float
     forward: Optional[np.ndarray]
     backward: Optional[np.ndarray]
     central: Optional[np.ndarray]
-    jac_dir: np.ndarray
+    jac_dir: np.ndarray             # The reported directional derivative (J * d)
     err_forward: float
     err_backward: float
     err_central: float
-    note: str
+    note: str                       # Human-readable interpretation of the geometry
 
 
 def asymmetry(
     example: Example,
     jac: Sensitivities,
-    direction=None,
+    direction: Optional[str | np.ndarray] = None,
     t: float = 1e-4,
     block: str = "x",
     kind: Optional[str] = "min",
 ) -> Asymmetry:
-    """One-sided difference quotients vs the reported directional derivative.
+    """
+    Compares one-sided difference quotients against the reported directional derivative.
 
-    A fold shows up as one side being ``None``; an active-set kink as both being
-    finite and different, in which case the reported Jacobian can match at most
-    one of them.
+    This test checks how the differentiator handles non-smoothness in the solution map:
+      - A "fold" or infeasibility boundary: The solution only exists for t > 0 or t < 0.
+      - An active-set "kink": The solution exists on both sides, but the forward 
+        and backward derivatives are distinct.
+        
+    In cases of a kink, a single linear Jacobian can mathematically match at most 
+    one of the branches.
+
+    Args:
+        example: The parametric optimization example.
+        jac: The evaluated sensitivities (Jacobian).
+        direction: The perturbation direction.
+        t: A single, strictly positive step size to use for the finite differences.
+        block: The variable block to check (default "x").
+        kind: The requested solution character.
+
+    Returns:
+        An Asymmetry object detailing the finite differences and errors.
     """
     name, d = _dir(example, direction)
     dim, phibar = example.dims, example.phi_bar_np
+    
+    # Compute the directional derivative predicted by the provided Jacobian
     Jd = dim.rows(stack_sensitivities(jac, dim) @ d, block)
 
     def side(s: float) -> Optional[np.ndarray]:
+        """Helper to calculate the one-sided finite difference quotient."""
         points = example.solve(example.theta_bar + s * t * d)
         if not points:
             return None
         p = select_branch(points, phibar, dim, kind=kind)
+        assert p is not None
+        # Return the difference quotient: (phi(theta + s*t*d) - phi(theta)) / (s*t)
         return dim.rows(phi_np(p) - phibar, block) / (s * t)
 
+    # Evaluate forward (+1) and backward (-1) steps
     fwd, bwd = side(+1.0), side(-1.0)
+    
+    # Compute central difference if both sides exist
     cen = 0.5 * (fwd + bwd) if (fwd is not None and bwd is not None) else None
 
-    def e(v):
+    def e(v: Optional[np.ndarray]) -> float:
+        """Helper to compute absolute error against the predicted Jacobian step."""
         return float(np.linalg.norm(v - Jd)) if v is not None else np.nan
 
+    # Classify the geometric nature of the perturbation
     if fwd is None or bwd is None:
         note = "one-sided: solution exists on a single side (fold / infeasibility)"
     elif np.linalg.norm(fwd - bwd) > 1e-3 * max(1.0, float(np.linalg.norm(fwd))):
@@ -461,29 +488,57 @@ def asymmetry(
 def step_residual(
     example: Example,
     jac: Sensitivities,
-    direction=None,
+    direction: Optional[str | np.ndarray] = None,
     ts: Sequence[float] = (1e-1, 1e-2, 1e-3, 1e-4),
     kind: Optional[str] = "min",
 ) -> Table:
-    """``||r_P1(phi_bar + t J d, theta_bar + t d)||`` versus the frozen point.
+    """
+    Evaluates the predicted step as a warm-start candidate for an NLP solver.
 
-    Meaningful even where no nearby solution exists: is the predicted point a
-    better place to start a solve than the base point?
+    This function measures ``||r_P1(phi_bar + t * J * d, theta_bar + t * d)||``.
+    It compares the KKT residual of the *frozen* point (doing nothing) against the 
+    KKT residual of the *predicted* point (applying the Taylor step).
+
+    This metric is deeply practical: even if the true solution map is non-differentiable 
+    or a nearby solution doesn't exist, does following the derivative provide a better 
+    initial guess for the optimizer than just staying put?
+
+    Args:
+        example: The parametric optimization example.
+        jac: The evaluated sensitivities.
+        direction: The perturbation direction.
+        ts: Sequence of step sizes to evaluate.
+        kind: The requested solution character.
+
+    Returns:
+        A formatted Table comparing the frozen and predicted residuals.
     """
     name, d = _dir(example, direction)
     dim, phibar = example.dims, example.phi_bar_np
+    
+    # Handle NaN sensitivities gracefully by replacing them with zero (no motion)
     J = np.nan_to_num(stack_sensitivities(jac, dim), nan=0.0)
+    
     tab = Table(("t", "sign", "res_frozen", "res_pred", "ratio", "res_true"))
+    
     for t in ts:
         for s in (+1.0, -1.0):
+            # The perturbed parameter
             theta = example.theta_bar + s * t * d
+            
+            # r0: Residual if we just use the unperturbed solution (frozen)
             r0 = example.residual_phi(phibar, theta)
+            
+            # r1: Residual if we step along the Jacobian prediction (warm-start)
             r1 = example.residual_phi(phibar + J @ (s * t * d), theta)
+            
+            # rt: The exact residual of the true solution at the perturbed parameter
             points = example.solve(theta)
             rt = (
                 example.residual_phi(phi_np(select_branch(points, phibar, dim, kind=kind)), theta) # type: ignore
                 if points else np.nan
             )
+            
             tab.rows.append({"t": float(t), "sign": "+" if s > 0 else "-",
                              "res_frozen": r0, "res_pred": r1,
                              "ratio": r1 / max(r0, TINY), "res_true": rt})
@@ -495,12 +550,13 @@ def step_residual(
 # ---------------------------------------------------------------------------
 @dataclass
 class LossGradient:
+    """Data object storing downstream bilevel gradient accuracy."""
     example: str
     predicted: np.ndarray
     reference: np.ndarray
-    cosine: float
-    rel_error: float
-    t_used: float
+    cosine: float                   # Cosine similarity between predicted and true gradient
+    rel_error: float                # Relative error of the gradient magnitude
+    t_used: float                   # Finite difference step used for the reference
     note: str
 
     def __str__(self) -> str:  # pragma: no cover
@@ -518,51 +574,92 @@ def loss_gradient(
     kind: Optional[str] = "min",
     fd_step: float = 1e-6,
 ) -> LossGradient:
-    """Compare ``J^T grad_phi loss`` with a finite difference of ``loss(phi*(theta))``.
+    """
+    Compares the chain-rule gradient ``J^T grad_phi(loss)`` against the true gradient.
 
-    Cosine similarity is the number that matters downstream: a derivative with
-    50% relative error but cosine ~1 is still a descent direction.
+    In bilevel optimization or machine learning (e.g., differentiating through an argmin),
+    the user fundamentally wants $\\nabla_\\theta L(\\phi^*(\\theta))$. This function checks
+    if the provided Jacobian $J$ yields a useful downstream gradient.
+
+    Crucially, it reports the **cosine similarity**. A derivative might have a 50% 
+    relative error in magnitude, but if the cosine similarity is near 1.0, it is 
+    still a highly effective descent direction for gradient-based learning.
+
+    Args:
+        example: The parametric optimization example.
+        jac: The evaluated sensitivities (Jacobian).
+        loss: A scalar-valued downstream loss function consuming phi.
+        t: The step size for the finite difference approximation of the reference.
+        kind: The requested solution character.
+        fd_step: Step size for finite-differencing the downstream loss function itself.
+
+    Returns:
+        A LossGradient object tracking the alignment and error of the predicted gradient.
     """
     dim, phibar = example.dims, example.phi_bar_np
+    
+    # Replace any uncomputable derivatives with zero for the chain rule application
     J = np.nan_to_num(stack_sensitivities(jac, dim), nan=0.0)
 
+    # 1. Compute grad_phi(loss) via central finite differences on the given loss function
     gphi = np.zeros_like(phibar)
     for i in range(phibar.size):
         e = np.zeros_like(phibar)
         e[i] = fd_step
         gphi[i] = (loss(phibar + e) - loss(phibar - e)) / (2 * fd_step)
+        
+    # Apply the chain rule: predicted grad_theta = J^T * grad_phi
     predicted = J.T @ gphi
 
+    # 2. Compute the "true" reference grad_theta by applying finite differences 
+    # directly to the composition L(phi*(theta))
     ref = np.full(dim.n_theta, np.nan)
     missing = False
+    
     for j in range(dim.n_theta):
         e = np.zeros(dim.n_theta)
         e[j] = t
         vals = []
+        
+        # Evaluate the true solution map perturbed in the j-th basis direction
         for s in (+1.0, -1.0):
             points = example.solve(example.theta_bar + s * e)
             if not points:
                 missing = True
                 vals.append(np.nan)
                 continue
-            vals.append(loss(phi_np(select_branch(points, phibar, dim, kind=kind))))
+            sol = select_branch(points, phibar, dim, kind=kind)
+            assert sol is not None
+            vals.append(loss(phi_np(sol)))
+            
+        # Calculate finite difference based on which sides successfully solved
         if np.isfinite(vals[0]) and np.isfinite(vals[1]):
+            # Central difference
             ref[j] = (vals[0] - vals[1]) / (2 * t)
         elif np.isfinite(vals[0]):
+            # Forward difference
             ref[j] = (vals[0] - loss(phibar)) / t
         elif np.isfinite(vals[1]):
+            # Backward difference
             ref[j] = (loss(phibar) - vals[1]) / t
 
+    # 3. Calculate similarity and error metrics
     ok = np.isfinite(ref)
     if ok.sum() == 0:
+        # If the reference gradient is completely uncomputable
         cos, rel = np.nan, np.nan
     else:
+        # Compare only the finite/computable dimensions
         a, b = predicted[ok], ref[ok]
         denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        
+        # Cosine similarity: (a dot b) / (|a| * |b|)
         cos = float(a @ b / denom) if denom > 0 else np.nan
+        # Relative error
         rel = float(np.linalg.norm(a - b) / max(float(np.linalg.norm(b)), TINY))
 
     note = "one-sided reference (solution missing on a side)" if missing else "central reference"
+    
     return LossGradient(example.name, predicted, ref, cos, rel, float(t), note)
 
 
@@ -571,18 +668,26 @@ def loss_gradient(
 # ---------------------------------------------------------------------------
 @dataclass
 class EpsSweep:
+    """Data object storing the scaling behavior of a regularized Jacobian w.r.t. epsilon."""
     example: str
     direction: str
     block: str
     eps: np.ndarray
     table: Table
+    
     #: order in eps of the *linearisation* error at the largest probed t.  For a
     #: fold probed at t >> eps^2 the prediction t|J d| ~ t/eps swamps the true
     #: O(sqrt t) step, so the expected value is -1, NOT +1.  The O(eps) row of the
     #: theory table is the bias of the regularised *solution*: see solution_bias.
     linear_error_order: float
-    saturation_order: float    # ||J d|| ~ eps^saturation_order  (expect -1)
-    knee_order: float          # t_valid ~ eps^knee_order        (expect  2)
+    
+    #: The order at which the norm of the directional derivative scales.
+    #: ||J d|| ~ eps^saturation_order (we typically expect -1 for a fold).
+    saturation_order: float    
+    
+    #: The order at which the valid linearization radius scales.
+    #: t_valid ~ eps^knee_order (we typically expect 2 for a fold).
+    knee_order: float          
 
     def __str__(self) -> str:  # pragma: no cover
         return (
@@ -597,45 +702,86 @@ def eps_sweep(
     example: Example,
     jac_fn: Callable[[float], Sensitivities],
     eps: Sequence[float] = (1e-1, 3e-2, 1e-2, 3e-3, 1e-3),
-    direction=None,
-    ts: Sequence[float] = DEFAULT_TS,
+    direction: Optional[str | np.ndarray] = None,
+    ts: Sequence[float] | np.ndarray = DEFAULT_TS,
     block: str = "x",
     side: str = "auto",
     kind: Optional[str] = "min",
     tol: float = 0.25,
 ) -> EpsSweep:
-    """Run ``taylor`` for a family of regularisation weights and fit the rates."""
+    """
+    Runs the Taylor test for a family of regularization weights to fit scaling rates.
+
+    When optimizing through a singularity (like a fold or active-set change),
+    regularization (e.g., smoothing or interior point barrier eps) is often used. 
+    This sweep evaluates how the local linearization degrades as epsilon shrinks.
+    
+    It extracts three key properties:
+      1. linear_error_order: Does the prediction error explode?
+      2. saturation_order: Does the step magnitude explode?
+      3. knee_order: How quickly does the radius of validity shrink to zero?
+
+    Args:
+        example: The parametric optimization example.
+        jac_fn: A closure that takes an epsilon value and returns the evaluated Jacobian.
+        eps: Sequence of epsilon regularization values to test.
+        direction: The perturbation direction.
+        ts: Sequence of finite difference step sizes.
+        block: The variable block to check.
+        side: Target side of the perturbation ("+" or "-") or "auto" to pick one that exists.
+        kind: The requested solution character.
+        tol: The relative error tolerance for determining t_valid in the taylor test.
+
+    Returns:
+        An EpsSweep object tracking the structural breakdown of the derivative as eps -> 0.
+    """
     name, d = _dir(example, direction)
-    eps = np.asarray(list(eps), dtype=float)
+    eps_np = np.asarray(list(eps), dtype=float)
     tab = Table(("eps", "side", "|J d|", "err@t_max", "rel@t_max", "t_valid", "slope"))
+    
+    # We evaluate the worst-case error at the largest tested perturbation step
     big_t = float(max(ts))
+    
     Jn, errs, tvals = [], [], []
 
-    for e in eps:
+    for e in eps_np:
+        # Generate the Jacobian for the specific regularization parameter
         sens = jac_fn(float(e))
+        
+        # Run standard taylor diagnostics on this specific smoothed system
         rep = taylor(example, sens, direction=d, ts=ts, block=block, kind=kind, tol=tol)
         J = stack_sensitivities(sens, example.dims)
+        
+        # Resolve which side (+ or -) of the finite difference to use
         if side == "auto":
             cand = [s for s in ("+", "-") if rep.exists[s]]
             s_use = cand[0] if cand else "+"
         else:
             s_use = side
+            
+        # Extract the taylor test results for the largest step size (big_t)
         match = [r for r in rep.table.rows if r["sign"] == s_use and r["t"] == big_t]
-        err = float(match[0]["err"]) if match else np.nan
-        rel = float(match[0]["rel"]) if match else np.nan
+        err = float(match[0]["err"]) if match else np.nan # type: ignore
+        rel = float(match[0]["rel"]) if match else np.nan # type: ignore
+        
+        # Magnitude of the directional derivative 
         jd = float(np.linalg.norm(example.dims.rows(J @ d, block)))
+        
         tab.rows.append({"eps": float(e), "side": s_use, "|J d|": jd, "err@t_max": err,
                          "rel@t_max": rel, "t_valid": rep.t_valid[s_use],
                          "slope": rep.slope[s_use]})
+        
+        # Store for log-log slope extraction
         Jn.append(jd)
         errs.append(err)
         tvals.append(rep.t_valid[s_use])
 
+    # Fit a power law (slope in log-log space) for how these metrics scale with eps
     return EpsSweep(
-        example=example.name, direction=name, block=block, eps=eps, table=tab,
-        linear_error_order=loglog_slope(eps, errs),
-        saturation_order=loglog_slope(eps, Jn),
-        knee_order=loglog_slope(eps, tvals),
+        example=example.name, direction=name, block=block, eps=eps_np, table=tab,
+        linear_error_order=loglog_slope(eps_np.tolist(), errs),
+        saturation_order=loglog_slope(eps_np.tolist(), Jn),
+        knee_order=loglog_slope(eps_np.tolist(), tvals),
     )
 
 
@@ -645,23 +791,47 @@ def eps_sweep(
 def reg_jac_exactness(
     example: Example, jac: Sensitivities, varrho: float, rho: float
 ) -> Optional[Dict[str, float]]:
-    """For the quadratic examples the regularised KKT Jacobian is closed form.
+    """
+    Validates the computed Jacobian against a known, closed-form analytic matrix.
 
-    Any discrepancy is an implementation bug, not approximation error -- run this
-    before interpreting anything else.  Note the closed forms assume the plain
-    ``K + diag(varrho I, -rho I)`` system: if your P2's slack block or its
-    theta-dependent proximal centre changes the answer, the mismatch should show
-    up in specific columns rather than everywhere.
+    For basic quadratic examples, the regularized KKT Jacobian can be solved exactly
+    on paper. Any discrepancy found here implies a fundamental implementation bug in 
+    the algorithmic differentiation or KKT system assembly—not just a mathematical 
+    approximation error.
+    
+    Note: The closed forms assume the plain ``K + diag(varrho I, -rho I)`` system. 
+    If your solver uses a different proximal center or handles slack blocks differently,
+    the mismatch should show up in specific matrix columns rather than uniformly everywhere.
+
+    Args:
+        example: The parametric optimization example (which must provide 'reg_jac_exact').
+        jac: The numerically/algorithmically evaluated Sensitivities.
+        varrho: Primal regularization parameter.
+        rho: Dual regularization parameter.
+
+    Returns:
+        A dictionary containing absolute and relative errors, or None if the 
+        closed-form function doesn't exist or evaluation fails entirely.
     """
     fn = example.ls.get("reg_jac_exact")
     if fn is None:
+        # No analytic Jacobian available for this specific example problem
         return None
-    ref = np.asarray(fn(varrho, rho), dtype=float)
+        
+    # Get the mathematically exact reference Jacobian
+    ref = np.asarray(fn(varrho, rho), dtype=float) # type: ignore
+    
+    # Get the matrix to test
     got = stack_sensitivities(jac, example.dims)
+    
+    # We only compute error metrics on computable (finite) entries
     mask = np.isfinite(got)
     if not mask.any():
         return None
+        
+    # Worst-case absolute mismatch across all valid matrix entries
     abs_err = float(np.max(np.abs(got[mask] - ref[mask])))
+    
     return {
         "abs_err": abs_err,
         "rel_err": abs_err / max(float(np.max(np.abs(ref[mask]))), TINY),
@@ -674,13 +844,15 @@ def reg_jac_exactness(
 # ---------------------------------------------------------------------------
 @dataclass
 class SolutionBias:
+    """Data object storing the asymptotic error of a regularized solver as eps -> 0."""
+
     example: str
     direction: str
     block: str
     t: float
     eps: np.ndarray
-    bias: np.ndarray
-    order: float
+    bias: np.ndarray  # Absolute solution error ||phi_reg(eps) - phi_true||
+    order: float  # Asymptotics: bias ~ eps^order (e.g., order = 1.0 for O(eps))
 
     def __str__(self) -> str:  # pragma: no cover
         rows = "  ".join(f"{e:.1e}:{b:.2e}" for e, b in zip(self.eps, self.bias))
@@ -694,41 +866,79 @@ def solution_bias(
     example: Example,
     sol_fn: Callable[[np.ndarray, float], object],
     eps: Sequence[float] = (1e-1, 3e-2, 1e-2, 3e-3, 1e-3),
-    direction=None,
+    direction: Optional[str | np.ndarray] = None,
     t: float = 1e-2,
     sign: float = +1.0,
     block: str = "x",
     kind: Optional[str] = "min",
 ) -> SolutionBias:
-    """``||phi_reg(theta; eps) - phi_true(theta)||`` at fixed theta, as eps -> 0.
+    """Computes ||phi_reg(theta; eps) - phi_true(theta)|| at a fixed theta as eps -> 0.
 
-    The O(eps) entry of the theory table.  Deliberately separate from the
-    Jacobian metrics: measuring it requires the regularised *solution*, so pass a
-    callable ``(theta, eps) -> NLPSolution | array``.  Examples with a closed form
-    expose one under ``ls['reg_solution']`` / ``ls['relaxed_solution']``.
+    Measures the solution bias introduced by a smoothed, relaxed, or regularized
+    solver formulation (e.g., interior-point barrier penalty, quadratic primal-dual
+    regularization) at a fixed perturbed parameter point theta = theta_bar + sign * t * d.
+
+    Unlike Jacobian tests, this requires solving the regularized problem directly.
+    The parameter `sol_fn` must be a callable matching `(theta, eps) -> NLPSolution | Array`.
+
+    Args:
+        example: The parametric optimization example.
+        sol_fn: A solver function returning the regularized solution for a given (theta, eps).
+        eps: Sequence of regularization weights to sweep through.
+        direction: Direction of parameter perturbation d.
+        t: Fixed perturbation distance.
+        sign: Direction sign factor (+1.0 or -1.0).
+        block: Sliced variable block ("x", "lam", "nu", "all") to evaluate bias on.
+        kind: Preferred second-order character for branch selection on the true solution.
+
+    Returns:
+        A SolutionBias object containing the observed errors and log-log slope order.
     """
     name, d = _dir(example, direction)
     dim = example.dims
+
+    # Compute the fixed parameter point theta = theta_bar + sign * t * d
     theta = example.theta_bar + sign * t * d
+
+    # Obtain the true analytic KKT solutions at this theta
     points = example.solve(theta)
     ref = (
-        dim.rows(phi_np(select_branch(points, example.phi_bar_np, dim, kind=kind)), block)
-        if points else None
+        dim.rows(
+            phi_np(select_branch(points, example.phi_bar_np, dim, kind=kind)), block
+        )
+        if points
+        else None
     )
-    eps = np.asarray(list(eps), dtype=float)
+
+    eps_np = np.asarray(list(eps), dtype=float)
     bias = []
-    for e in eps:
+
+    for e in eps_np:
+        # Solve the regularized problem at (theta, eps)
         got = sol_fn(theta, float(e))
+
         if got is None or ref is None:
             bias.append(np.nan)
             continue
+
+        # Format and slice the output vector appropriately based on returned type
         if isinstance(got, NLPSolution):
             vec = dim.rows(phi_np(got), block)
         else:
             arr = np.atleast_1d(to_np(got)).reshape(-1)
+            # If the solver returned full phi, slice the requested block; otherwise treat as already sliced
             vec = dim.rows(arr, block) if arr.size == dim.n_phi else arr
+
+        # Distance between the regularized solution vector and the exact reference solution
         bias.append(float(np.linalg.norm(vec - ref)))
+
+    # Compute log-log slope to extract the order p in: bias ~ O(eps^p)
     return SolutionBias(
-        example=example.name, direction=name, block=block, t=float(t), eps=eps,
-        bias=np.asarray(bias), order=loglog_slope(eps, bias),
+        example=example.name,
+        direction=name,
+        block=block,
+        t=float(t),
+        eps=eps_np,
+        bias=np.asarray(bias),
+        order=loglog_slope(eps_np.tolist(), bias),
     )
