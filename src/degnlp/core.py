@@ -95,6 +95,7 @@ class Example:
     #: unnormalised generators of ker K in phi-space, as ``(u, v_ineq, v_eq)``
     kernel: Tuple[Tuple[Array, Array, Array], ...] = ()
     #: analytic Lyapunov-Schmidt data / closed forms, free-form
+    # TODO: I don't like "object" being here
     ls: Dict[str, object] = field(default_factory=dict)
     notes: str = ""
 
@@ -217,7 +218,7 @@ def select_branch(
     dists = [np.linalg.norm(dims.rows(phi_np(b), block) - ref) for b in pool]
     return pool[int(np.argmin(dists))]
 
-
+# TODO: check this
 def loglog_slope(xs: Sequence[float], ys: Sequence[float], last: Optional[int] = None) -> float:
     """Fitted exponent ``p`` in ``y ~ C * x**p`` -- i.e. an observed rate.
 
@@ -237,17 +238,17 @@ def loglog_slope(xs: Sequence[float], ys: Sequence[float], last: Optional[int] =
     poisoning it.  Fewer than two usable points returns NaN, which the callers
     read as "no rate to report".
     """
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    order = np.argsort(xs)
-    xs, ys = xs[order], ys[order]
+    xs_np = np.asarray(xs, dtype=float)
+    ys_np = np.asarray(ys, dtype=float)
+    order = np.argsort(xs_np)
+    xs_np, ys_np = xs_np[order], ys_np[order]
     if last is not None:
-        xs, ys = xs[:last], ys[:last]
-    ok = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
+        xs_np, ys_np = xs_np[:last], ys_np[:last]
+    ok = np.isfinite(xs_np) & np.isfinite(ys_np) & (xs_np > 0) & (ys_np > 0)
     if int(ok.sum()) < 2:
         return float("nan")
-    A = np.stack([np.log(xs[ok]), np.ones(int(ok.sum()))], axis=1)
-    sol, *_ = np.linalg.lstsq(A, np.log(ys[ok]), rcond=None)
+    A = np.stack([np.log(xs_np[ok]), np.ones(int(ok.sum()))], axis=1)
+    sol, *_ = np.linalg.lstsq(A, np.log(ys_np[ok]), rcond=None)
     return float(sol[0])
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ print(report.run_suite(FiniteDifferenceOracle(t=1e-6)))
 rule("2b. the unregularised baseline on the same problems")
 print(report.run_suite(IFT(mode="active_set")))
 
+raise Exception
+
 rule("3. fold: the three predicted rates")
 fold = ex_mod.get("fold")
 sweep = M.eps_sweep(

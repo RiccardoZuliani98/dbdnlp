@@ -11,7 +11,7 @@ the differentiator protocol.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Protocol, Tuple, Union, runtime_checkable
+from typing import Dict, Optional, Protocol, Tuple, runtime_checkable
 
 import casadi as ca
 import numpy as np

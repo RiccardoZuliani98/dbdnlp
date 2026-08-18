@@ -127,8 +127,11 @@ def test_oracle_is_second_order_on_regular_example():
 
 def _zeros(ex):
     d = ex.dims
-    return {"x": np.zeros((d.n_x, d.n_theta)), "lam": np.zeros((d.n_ineq, d.n_theta)),
-            "nu": np.zeros((d.n_eq, d.n_theta))}
+    return {
+        "x": np.zeros((d.n_x, d.n_theta)), 
+        "lam": np.zeros((d.n_ineq, d.n_theta)),
+        "nu": np.zeros((d.n_eq, d.n_theta))
+    }
 
 
 def test_zero_jacobian_is_first_order_on_regular_example():

@@ -78,6 +78,7 @@ class FiniteDifferenceOracle:
     ``report.jacobian_for`` does that automatically.
     """
 
+    # TODO: describe this better
     example: object = None
     t: float = 1e-5
     kind: Optional[str] = "min"

@@ -19,9 +19,11 @@ from .core import Example, stack_sensitivities
 from .reference import FiniteDifferenceOracle
 from .types import NLPSolution, Sensitivities
 
+# TODO: what is this? Do we need a differentiate object here, or can we pull
+# from types.py?
 Differentiate = Callable[[object, NLPSolution], Sensitivities]
 
-
+# TODO: there's no way we need this. I'll change the signature of the differentiator methods
 def jacobian_for(differentiator: Differentiate, example: Example) -> Sensitivities:
     """Call a differentiator on an example's NLP and reference solution.
 
@@ -33,7 +35,7 @@ def jacobian_for(differentiator: Differentiate, example: Example) -> Sensitiviti
         diff = diff.bind(example)
     return diff(example.nlp, example.phi_bar)
 
-
+# TODO: this needs proper explanation
 @dataclass
 class Row:
     example: str

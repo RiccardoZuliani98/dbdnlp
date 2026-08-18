@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import casadi as ca
 import numpy as np
 
 from .core import (
@@ -31,6 +30,7 @@ TINY = 1e-300
 
 
 # ---------------------------------------------------------------------------
+# TODO: what is this?
 def _dir(example: Example, direction) -> Tuple[str, np.ndarray]:
     if direction is None:
         name = next(iter(example.directions))
@@ -40,7 +40,7 @@ def _dir(example: Example, direction) -> Tuple[str, np.ndarray]:
     d = np.atleast_1d(np.asarray(direction, dtype=float))
     return "<custom>", d / max(np.linalg.norm(d), TINY)
 
-
+# TODO: this is definitely not needed
 def residual_at(example: Example, phi: np.ndarray, theta: np.ndarray) -> float:
     """||KKT residual|| of an arbitrary primal-dual vector, via ``funcs.kkt``."""
     return example.residual_phi(phi, theta)
@@ -117,7 +117,7 @@ class Hoelder:
 def hoelder(
     example: Example,
     direction=None,
-    ts: Sequence[float] = DEFAULT_TS,
+    ts: Sequence[float] | np.ndarray = DEFAULT_TS,
     block: str = "x",
     kind: Optional[str] = "min",
     fit_last: int = 6,
@@ -143,6 +143,7 @@ def hoelder(
                 continue
             exists[key] = True
             p = select_branch(points, phibar, dim, kind=kind)
+            assert p is not None
             nrm = float(np.linalg.norm(dim.rows(phi_np(p) - phibar, block)))
             dists[key].append((float(t), nrm))
             tab.rows.append({"t": float(t), "sign": key, "exists": True,
@@ -154,6 +155,7 @@ def hoelder(
         if not pts:
             expo[key] = np.nan
         elif max(v for _, v in pts) <= 1e-14:
+            # TODO: why infinity?
             expo[key] = np.inf
         else:
             expo[key] = loglog_slope([a for a, _ in pts], [b for _, b in pts], last=fit_last)
@@ -195,9 +197,11 @@ def _classify(slope: float, true_slope: float, exists: bool) -> str:
         return "no solution to predict"
     if not np.isfinite(true_slope):
         if not np.isfinite(slope):
+            # both infinite
             return "constant solution, correctly predicted"
         return "constant solution, derivative reports spurious motion"
     if not np.isfinite(slope):
+        # true_slope is finite, slope is infinite
         return "exact (no error)"
     if slope >= 1.8:
         return "second order (derivative exact)"
@@ -212,7 +216,7 @@ def taylor(
     example: Example,
     jac: Sensitivities,
     direction=None,
-    ts: Sequence[float] = DEFAULT_TS,
+    ts: Sequence[float] | np.ndarray = DEFAULT_TS,
     block: str = "x",
     kind: Optional[str] = "min",
     tol: float = 0.25,
@@ -250,11 +254,13 @@ def taylor(
                 continue
             exists[key] = True
             p = select_branch(points, phibar, dim, kind=kind)
+            assert p is not None
             true_step = dim.rows(phi_np(p) - phibar, block)
             err = float(np.linalg.norm(true_step - pred))
             pred_phi = phibar.copy()
             pred_phi[dim.blocks[block]] = dim.rows(phibar, block) + pred
             nearest = select_branch(points, pred_phi, dim, kind=kind, block=block)
+            assert nearest is not None
             err_set = float(
                 np.linalg.norm(dim.rows(phi_np(nearest), block) - dim.rows(pred_phi, block))
             )
