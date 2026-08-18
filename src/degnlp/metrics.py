@@ -201,10 +201,13 @@ def _classify(slope: float, true_slope: float, exists: bool) -> str:
     if not np.isfinite(slope):
         # true_slope is finite, slope is infinite
         return "exact (no error)"
+    # if slope is of order 2, we are dealing with a quadratic residual term
     if slope >= 1.8:
         return "second order (derivative exact)"
+    # if order one, our derivative is wrong
     if slope >= 0.9:
         return "first order (biased derivative)"
+    # if less than one, we are dealing with a non-differentiable object
     if true_slope < 0.9:
         return "sublinear: true map is not differentiable"
     return "sublinear (unexplained)"
@@ -229,30 +232,57 @@ def taylor(
     order of the error in t, and the largest t at which the prediction is still
     within ``tol`` relatively.
     """
+
+    # get direction
     name, d = _dir(example, direction)
+
+    # get dimensions and solution
     dim, phibar = example.dims, example.phi_bar_np
+
+    # stack the sensitivities
     Jb = dim.rows(stack_sensitivities(jac, dim), block)
 
+    # start table
     tab = Table(("t", "sign", "exists", "|d phi|", "|pred|", "err", "err_set", "rel"))
     errs: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
     trues: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
     rels: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
+
+    # flag that identifies if solution branch exists for both positive
+    # and negative perturbations
     exists = {"+": False, "-": False}
 
+    # loop through perturbation magnitudes
     for t in ts:
+        
+        # loop through positive and negative perturbations
         for s in (+1.0, -1.0):
             key = "+" if s > 0 else "-"
+
+            # compute perturbation
             dtheta = s * t * d
+
+            # compute predicted solution change
             pred = Jb @ dtheta
+
+            # solve at new parameter value
             points = example.solve(example.theta_bar + dtheta)
+
+            # return nans if solve fails
             if not points:
                 tab.rows.append({"t": float(t), "sign": key, "exists": False,
                                  "|d phi|": np.nan, "|pred|": float(np.linalg.norm(pred)),
                                  "err": np.nan, "err_set": np.nan, "rel": np.nan})
                 continue
+                
+            # otherwise, flag as solved
             exists[key] = True
+
+            # pick closest solution
             p = select_branch(points, phibar, dim, kind=kind)
             assert p is not None
+
+            # true parameter change and error
             true_step = dim.rows(phi_np(p) - phibar, block)
             err = float(np.linalg.norm(true_step - pred))
             pred_phi = phibar.copy()
