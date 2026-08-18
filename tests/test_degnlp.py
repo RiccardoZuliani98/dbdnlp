@@ -5,7 +5,6 @@ Run with:  pytest -q
 
 from __future__ import annotations
 
-import casadi as ca
 import numpy as np
 import pytest
 
@@ -15,7 +14,7 @@ from degnlp import examples as ex_mod
 from degnlp import metrics as M
 from degnlp import report
 from degnlp.core import kind_of, phi_np, stack_sensitivities
-from degnlp.reference import IFT, FiniteDifferenceOracle, Regularized
+from degnlp.reference import FiniteDifferenceOracle, Regularized
 from degnlp.report import jacobian_for
 from degnlp.types import NLPSolution, to_np
 
