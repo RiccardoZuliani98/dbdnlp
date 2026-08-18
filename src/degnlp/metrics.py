@@ -25,35 +25,51 @@ from .core import (
 )
 from .types import NLPSolution, Sensitivities, to_np
 
+# Default sequence of step sizes (t) for finite difference checks, spaced logarithmically
 DEFAULT_TS = np.geomspace(1e-1, 1e-6, 13)
+# A tiny number to avoid division by zero
 TINY = 1e-300
 
 
-def _dir(example: Example, direction) -> Tuple[str, np.ndarray]:
-    # if no direction is passed, pass next direction from example
+def _dir(example: Example, direction: Optional[str | np.ndarray]) -> Tuple[str, np.ndarray]:
+    """
+    Extracts and normalizes the perturbation direction.
+
+    Args:
+        example: The parametric example containing default directions.
+        direction: Either a string (name of a pre-defined direction), None (picks 
+            the first available direction), or a custom numeric array.
+
+    Returns:
+        A tuple containing the name of the direction and the normalized direction array.
+    """
+    # If no direction is passed, default to the first available direction in the example
     if direction is None:
         name = next(iter(example.directions))
         return name, example.direction(name)
-    # if string is passed, look for a direction with that name
+    
+    # If a string is passed, look up the predefined direction by name
     if isinstance(direction, str):
         return direction, example.direction(direction)
-    # otherwise, we are dealing with a custom direction (given numerically)
-    # and we normalize it first.
+    
+    # Otherwise, handle a custom numeric direction and normalize it
     d = np.atleast_1d(np.asarray(direction, dtype=float))
     return "<custom>", d / max(np.linalg.norm(d), TINY)
 
 
 @dataclass
 class Table:
-    """A tiny table with named columns, printable and easy to post-process."""
+    """A tiny table utility with named columns, used for logging and post-processing."""
 
     columns: Tuple[str, ...]
     rows: List[Dict[str, object]] = field(default_factory=list)
 
     def col(self, name: str) -> np.ndarray:
+        """Extracts a specific column as a numpy float array, filling missing values with NaN."""
         return np.array([r.get(name, np.nan) for r in self.rows], dtype=float)
 
     def __str__(self) -> str:  # pragma: no cover - formatting only
+        """Formats the table into a readable string with aligned columns."""
         widths = {c: max(len(c), 11) for c in self.columns}
         head = "  ".join(f"{c:>{widths[c]}}" for c in self.columns)
         lines = [head, "-" * len(head)]
@@ -64,6 +80,7 @@ class Table:
                 if isinstance(v, bool):
                     cells.append(f"{('yes' if v else 'no'):>{widths[c]}}")
                 elif isinstance(v, float):
+                    # Format finite floats in scientific notation, handle NaNs
                     cells.append(
                         f"{v:>{widths[c]}.3e}" if np.isfinite(v) else f"{'--':>{widths[c]}}"
                     )
@@ -78,6 +95,7 @@ class Table:
 # ---------------------------------------------------------------------------
 @dataclass
 class Hoelder:
+    """Data object storing the results of a Hölder continuity check."""
     example: str
     direction: str
     block: str
@@ -88,17 +106,21 @@ class Hoelder:
 
     @property
     def matches_expected(self) -> Dict[str, bool]:
+        """Validates if the computed Hölder exponents match the theoretical expectations."""
         out = {}
         for s in ("+", "-"):
             exp = self.expected.get(s, "unset")
             if exp == "unset":
                 out[s] = True
             elif exp is None:
+                # Expects no solution to exist
                 out[s] = not self.exists[s]
             elif not np.isfinite(exp):
+                # Expects an infinite slope (step doesn't affect the solution)
                 out[s] = self.exists[s] and not np.isfinite(self.exponent[s])
             else:
-                assert not isinstance(exp,str)
+                # Expects a specific exponent (e.g., 1.0 for Lipschitz, 0.5 for square-root behavior)
+                assert not isinstance(exp, str)
                 out[s] = self.exists[s] and abs(self.exponent[s] - exp) < 0.08
         return out
 
@@ -114,19 +136,34 @@ class Hoelder:
 
 def hoelder(
     example: Example,
-    direction=None,
+    direction: Optional[str | np.ndarray] = None,
     ts: Sequence[float] | np.ndarray = DEFAULT_TS,
     block: str = "x",
     kind: Optional[str] = "min",
     fit_last: int = 6,
 ) -> Hoelder:
-    """Observed exponent of ||phi(theta_bar + t d) - phi_bar|| ~ t^p.
+    """
+    Computes the observed Hölder exponent of the solution mapping.
+    
+    This function tracks the distance $\|\phi(\bar{\theta} + t d) - \bar{\phi}\|$ 
+    as $t \to 0$ and fits a line in log-log space to find the exponent $p$ such 
+    that the distance is proportional to $t^p$.
 
-    Validates the *examples* independently of any differentiator: a problem
-    claimed to be Hoelder-1/2 must measure 0.5.
+    Args:
+        example: The parametric optimization example.
+        direction: The direction of perturbation (string name or numerical array).
+        ts: A sequence of step sizes (t) to evaluate.
+        block: The specific variable block in the solution to monitor (default "x").
+        kind: Branch selection criteria if multiple solutions exist.
+        fit_last: Number of points to use for the log-log linear regression slope.
+
+    Returns:
+        A Hoelder object containing exponents for both positive and negative perturbations.
     """
     name, d = _dir(example, direction)
     dim, phibar = example.dims, example.phi_bar_np
+    
+    # Initialize the tracking table and data structures
     tab = Table(("t", "sign", "exists", "|d phi|", "kind"))
     dists: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
     exists = {"+": False, "-": False}
@@ -134,26 +171,32 @@ def hoelder(
     for t in ts:
         for s in (+1.0, -1.0):
             key = "+" if s > 0 else "-"
+            
+            # Solve the problem at the perturbed parameter value
             points = example.solve(example.theta_bar + s * t * d)
             if not points:
                 tab.rows.append({"t": float(t), "sign": key, "exists": False,
                                  "|d phi|": np.nan, "kind": "-"})
                 continue
+            
             exists[key] = True
             p = select_branch(points, phibar, dim, kind=kind)
             assert p is not None
+            
+            # Compute the actual displacement in the specified variable block
             nrm = float(np.linalg.norm(dim.rows(phi_np(p) - phibar, block)))
             dists[key].append((float(t), nrm))
             tab.rows.append({"t": float(t), "sign": key, "exists": True,
                              "|d phi|": nrm, "kind": kind_of(p)})
 
+    # Calculate log-log slope (exponent) for both perturbation directions
     expo = {}
     for key in ("+", "-"):
         pts = dists[key]
         if not pts:
             expo[key] = np.nan
         elif max(v for _, v in pts) <= 1e-14:
-            # TODO: why infinity?
+            # If the displacement is effectively zero, the map is constant (infinite exponent)
             expo[key] = np.inf
         else:
             expo[key] = loglog_slope([a for a, _ in pts], [b for _, b in pts], last=fit_last)
@@ -169,15 +212,16 @@ def hoelder(
 # ---------------------------------------------------------------------------
 @dataclass
 class Taylor:
+    """Data object storing the results of a Taylor approximation check."""
     example: str
     direction: str
     block: str
     table: Table
-    slope: Dict[str, float]        # order of the prediction error in t
-    true_slope: Dict[str, float]   # order of the true step;  inf = does not move
+    slope: Dict[str, float]        # Order of the prediction error in t (ideally >= 2)
+    true_slope: Dict[str, float]   # Order of the true step in t (ideally 1 for regular maps)
     exists: Dict[str, bool]
-    t_valid: Dict[str, float]      # largest t with relative error <= tol
-    verdict: Dict[str, str]
+    t_valid: Dict[str, float]      # Largest step size t where rel error <= tol
+    verdict: Dict[str, str]        # Human-readable interpretation of the results
     tol: float
 
     def __str__(self) -> str:  # pragma: no cover
@@ -191,24 +235,26 @@ class Taylor:
 
 
 def _classify(slope: float, true_slope: float, exists: bool) -> str:
+    """
+    Classifies the quality of the Jacobian based on the convergence rates 
+    of the error and the true solution trajectory.
+    """
     if not exists:
         return "no solution to predict"
     if not np.isfinite(true_slope):
         if not np.isfinite(slope):
-            # both infinite
             return "constant solution, correctly predicted"
         return "constant solution, derivative reports spurious motion"
     if not np.isfinite(slope):
-        # true_slope is finite, slope is infinite
         return "exact (no error)"
-    # if slope is of order 2, we are dealing with a quadratic residual term
     if slope >= 1.8:
+        # Error drops quadratically: indicates a perfectly accurate first derivative
         return "second order (derivative exact)"
-    # if order one, our derivative is wrong
     if slope >= 0.9:
+        # Error drops linearly: derivative is fundamentally wrong (or missing terms)
         return "first order (biased derivative)"
-    # if less than one, we are dealing with a non-differentiable object
     if true_slope < 0.9:
+        # True solution movement is sublinear (e.g., Hölder-1/2); map isn't differentiable
         return "sublinear: true map is not differentiable"
     return "sublinear (unexplained)"
 
@@ -216,7 +262,7 @@ def _classify(slope: float, true_slope: float, exists: bool) -> str:
 def taylor(
     example: Example,
     jac: Sensitivities,
-    direction=None,
+    direction: Optional[str | np.ndarray] = None,
     ts: Sequence[float] | np.ndarray = DEFAULT_TS,
     block: str = "x",
     kind: Optional[str] = "min",
@@ -224,67 +270,74 @@ def taylor(
     fit_last: int = 6,
     noise_floor: float = 1e-13,
 ) -> Taylor:
-    """Compare the first-order prediction ``phi_bar + t J d`` against truth.
-
-    Reports, per side: absolute error, distance from the predicted point to the
-    solution *set* (the right notion when the minimiser is non-unique), relative
-    error (``rel ~ 1`` means the derivative carries no information), the fitted
-    order of the error in t, and the largest t at which the prediction is still
-    within ``tol`` relatively.
     """
+    Compares the first-order Taylor prediction $\bar{\phi} + t J d$ against the true solution.
 
-    # get direction
+    This acts as a robust numerical derivative test. It calculates:
+      - The true displacement of the solution.
+      - The expected displacement based on the provided Jacobian matrix.
+      - The absolute and relative errors between prediction and truth.
+      - The asymptotic order (slope in log-log space) of the error as step size shrinks.
+
+    Args:
+        example: The parametric optimization example.
+        jac: The Jacobian matrix to be evaluated.
+        direction: Direction of perturbation (string name or numerical array).
+        ts: Sequence of perturbation step sizes.
+        block: The specific variable block in the solution to check (default "x").
+        kind: Branch selection criteria if multiple solutions exist.
+        tol: Relative error threshold to determine `t_valid` limit.
+        fit_last: Number of points to use for the log-log linear regression slope.
+        noise_floor: Lower bound for absolute error threshold to ignore numerical noise.
+
+    Returns:
+        A Taylor object with detailed error evaluations, log-log slopes, and classifications.
+    """
+    # Normalize direction and fetch problem specifics
     name, d = _dir(example, direction)
-
-    # get dimensions and solution
     dim, phibar = example.dims, example.phi_bar_np
 
-    # stack the sensitivities
+    # Stack the given Jacobian and slice out the target block
     Jb = dim.rows(stack_sensitivities(jac, dim), block)
 
-    # start table
+    # Initialize data tracking
     tab = Table(("t", "sign", "exists", "|d phi|", "|pred|", "err", "err_set", "rel"))
     errs: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
     trues: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
     rels: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
-
-    # flag that identifies if solution branch exists for both positive
-    # and negative perturbations
     exists = {"+": False, "-": False}
 
-    # loop through perturbation magnitudes
+    # Loop through perturbation magnitudes
     for t in ts:
-        
-        # loop through positive and negative perturbations
+        # Loop through positive and negative perturbation directions
         for s in (+1.0, -1.0):
             key = "+" if s > 0 else "-"
-
-            # compute perturbation
+            
+            # Compute parameter perturbation (dtheta) and predicted step
             dtheta = s * t * d
-
-            # compute predicted solution change
             pred = Jb @ dtheta
 
-            # solve at new parameter value
+            # Solve at the new parameter value to get the "true" solution
             points = example.solve(example.theta_bar + dtheta)
 
-            # return nans if solve fails
             if not points:
+                # Log a failure to solve
                 tab.rows.append({"t": float(t), "sign": key, "exists": False,
                                  "|d phi|": np.nan, "|pred|": float(np.linalg.norm(pred)),
                                  "err": np.nan, "err_set": np.nan, "rel": np.nan})
                 continue
                 
-            # otherwise, flag as solved
             exists[key] = True
 
-            # pick closest solution
+            # Pick closest branch to original unperturbed solution
             p = select_branch(points, phibar, dim, kind=kind)
             assert p is not None
 
-            # true parameter change and error
+            # Calculate actual step and prediction residual
             true_step = dim.rows(phi_np(p) - phibar, block)
             err = float(np.linalg.norm(true_step - pred))
+            
+            # Determine error against the solution set (important if minimizers aren't unique)
             pred_phi = phibar.copy()
             pred_phi[dim.blocks[block]] = dim.rows(phibar, block) + pred
             nearest = select_branch(points, pred_phi, dim, kind=kind, block=block)
@@ -292,19 +345,29 @@ def taylor(
             err_set = float(
                 np.linalg.norm(dim.rows(phi_np(nearest), block) - dim.rows(pred_phi, block))
             )
+            
+            # Compute relative error 
             nt = float(np.linalg.norm(true_step))
             rel = err / max(nt, TINY)
+            
+            # Filter noise floor for log-log regression tracking
             if err > noise_floor * max(1.0, nt):
                 errs[key].append((float(t), err))
+            
             trues[key].append((float(t), nt))
             rels[key].append((float(t), rel))
+            
+            # Log step metrics to table
             tab.rows.append({"t": float(t), "sign": key, "exists": True,
                              "|d phi|": nt, "|pred|": float(np.linalg.norm(pred)),
                              "err": err, "err_set": err_set, "rel": rel})
 
+    # Post-process errors to identify convergence rates
     slope, true_slope, tvalid, verdict = {}, {}, {}, {}
     for key in ("+", "-"):
         e, tr, rl = errs[key], trues[key], rels[key]
+        
+        # Determine log-log slopes (exponent properties)
         slope[key] = loglog_slope([a for a, _ in e], [b for _, b in e], last=fit_last) if e else np.nan
         if not tr:
             true_slope[key] = np.nan
@@ -312,6 +375,8 @@ def taylor(
             true_slope[key] = np.inf
         else:
             true_slope[key] = loglog_slope([a for a, _ in tr], [b for _, b in tr], last=fit_last)
+            
+        # Determine validation range and final classification
         ok = [a for a, r in rl if np.isfinite(r) and r <= tol]
         tvalid[key] = max(ok) if ok else np.nan
         verdict[key] = _classify(slope[key], true_slope[key], exists[key])
