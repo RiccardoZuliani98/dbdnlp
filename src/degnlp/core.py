@@ -97,7 +97,7 @@ class Example:
     #: analytic Lyapunov-Schmidt data / closed forms, free-form
     ls: Dict[str, object] = field(default_factory=dict)
     notes: str = ""
-    
+
     _phi_bar: Optional[NLPSolution] = None
 
     @property
@@ -115,7 +115,7 @@ class Example:
 
     def solve(self, theta: Array, with_properties: bool = False) -> List[NLPSolution]:
         """Every nearby KKT point at ``theta``, analytically -- no solver call."""
-        
+
         # ensure proper type in theta
         theta = np.atleast_1d(np.asarray(theta, dtype=float))
 
@@ -191,7 +191,6 @@ class Example:
 # ---------------------------------------------------------------------------
 # branch selection
 # ---------------------------------------------------------------------------
-# TODO: this function and the next should be merged into one
 def select_branch(
     branches: Sequence[NLPSolution],
     reference: Array,
@@ -199,7 +198,18 @@ def select_branch(
     kind: Optional[str] = "min",
     block: str = "all",
 ) -> Optional[NLPSolution]:
-    """Pick the branch closest to ``reference`` in ``block``, preferring ``kind``."""
+    """Pick the branch closest to ``reference`` in ``block``, preferring ``kind``.
+
+    This doubles as the distance-to-the-solution-*set* query, which is the honest
+    error metric when the minimiser is non-unique (pitchfork, LICQ-degenerate
+    multipliers).  The nearest branch realises that minimum by construction, so
+    the distance is just
+
+        np.linalg.norm(dims.rows(phi_np(result), block)
+                       - dims.rows(reference, block))
+
+    with no second search needed.
+    """
     if not branches:
         return None
     pool = [b for b in branches if kind is None or kind_of(b) == kind] or list(branches)
@@ -208,27 +218,24 @@ def select_branch(
     return pool[int(np.argmin(dists))]
 
 
-def distance_to_set(
-    branches: Sequence[NLPSolution],
-    point: Array,
-    dims: Dims,
-    kind: Optional[str] = "min",
-    block: str = "all",
-) -> float:
-    """Distance from ``point`` to the solution *set* (the right metric when the
-    minimiser is non-unique, e.g. pitchfork or LICQ-degenerate multipliers)."""
-    if not branches:
-        return float("nan")
-    pool = [b for b in branches if kind is None or kind_of(b) == kind] or list(branches)
-    pt = dims.rows(np.asarray(point, dtype=float), block)
-    return float(min(np.linalg.norm(dims.rows(phi_np(b), block) - pt) for b in pool))
-
-#TODO: I don't understand this function
 def loglog_slope(xs: Sequence[float], ys: Sequence[float], last: Optional[int] = None) -> float:
-    """Least-squares slope of log y vs log x over the finite, positive entries.
+    """Fitted exponent ``p`` in ``y ~ C * x**p`` -- i.e. an observed rate.
 
-    ``last`` restricts the fit to the ``last`` smallest ``xs`` (the asymptotic
-    end), which is what you want for observed convergence orders.
+    Taking logs turns a power law into a straight line, ``log y = log C +
+    p log x``, so the least-squares slope through the ``(log x, log y)`` points
+    estimates ``p``.  Every rate the harness reports is read off this way.  Feed
+    it (step size, prediction error) and ``p = 2`` says the derivative is exact,
+    ``p = 1`` that it is biased, ``p = 0.5`` that the true solution map is
+    Hoelder and no derivative can help.  Feed it (regularisation weight,
+    ``|J d|``) instead and ``p = -1`` is the ``O(1/eps)`` Lipschitz blow-up.
+
+    Two details matter.  ``last`` keeps only the ``last`` *smallest* ``xs``,
+    because a rate is an asymptotic statement and pre-asymptotic points at large
+    ``x`` would tilt the fit.  Non-finite and non-positive entries are dropped
+    rather than fitted, since their logs do not exist -- that is how "no solution
+    on this side" (NaN) and "error exactly zero" leave the fit instead of
+    poisoning it.  Fewer than two usable points returns NaN, which the callers
+    read as "no rate to report".
     """
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)

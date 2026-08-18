@@ -2,9 +2,8 @@
 Tier 1 -- scalar catastrophe normal forms (SOSC-type degeneracy).
 Tier 2 -- constraint-side degeneracy (LICQ-type, mixed kernel, existence).
 
-Each example supplies a CasADi builder in the codebase convention
-``() -> (primal, param, cost, ineq, eq)`` and an analytic ``branches`` function
-returning every nearby KKT point as an ``NLPSolution``, so
+Each example constructs its ``DifferentiableNLP`` and supplies an analytic
+``branches`` function returning every nearby KKT point as an ``NLPSolution``, so
 ground truth needs no solver.  ``EXPECTED`` records what the theory predicts,
 which lets the library check itself (``metrics.hoelder``).
 
@@ -17,6 +16,8 @@ from typing import Callable, Dict, List, Optional
 
 import casadi as ca
 import numpy as np
+
+from dbdnlp._impl.nlp import DifferentiableNLP
 
 from .core import Example
 from .types import NLPSolution
@@ -48,10 +49,9 @@ def fold() -> Example:
     1/varrho at theta = 0, bias -varrho/2, fold displaced to theta = -varrho^2/4.
     """
 
-    def build():
-        x = ca.SX.sym("x", 1)
-        th = ca.SX.sym("theta", 1)
-        return x, th, x[0] ** 3 / 3 - th[0] * x[0], None, None
+    x = ca.SX.sym("x", 1)
+    th = ca.SX.sym("theta", 1)
+    nlp = DifferentiableNLP(x, th, x[0] ** 3 / 3 - th[0] * x[0])
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t = float(theta[0])
@@ -70,7 +70,7 @@ def fold() -> Example:
     return Example(
         name="fold",
         tags=("tier1", "sosc", "fold", "existence"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0),
         branches=branches,
         directions={"unfold": _a(1.0)},
@@ -96,10 +96,9 @@ def cusp() -> Example:
     rather than a translation.
     """
 
-    def build():
-        x = ca.SX.sym("x", 1)
-        th = ca.SX.sym("theta", 1)
-        return x, th, x[0] ** 4 / 4 - th[0] * x[0], None, None
+    x = ca.SX.sym("x", 1)
+    th = ca.SX.sym("theta", 1)
+    nlp = DifferentiableNLP(x, th, x[0] ** 4 / 4 - th[0] * x[0])
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         x = float(np.cbrt(float(theta[0])))
@@ -114,7 +113,7 @@ def cusp() -> Example:
     return Example(
         name="cusp",
         tags=("tier1", "sosc", "cusp"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0),
         branches=branches,
         directions={"unfold": _a(1.0)},
@@ -140,10 +139,9 @@ def pitchfork() -> Example:
     bifurcation to theta = varrho.
     """
 
-    def build():
-        x = ca.SX.sym("x", 1)
-        th = ca.SX.sym("theta", 1)
-        return x, th, x[0] ** 4 / 4 - th[0] * x[0] ** 2 / 2, None, None
+    x = ca.SX.sym("x", 1)
+    th = ca.SX.sym("theta", 1)
+    nlp = DifferentiableNLP(x, th, x[0] ** 4 / 4 - th[0] * x[0] ** 2 / 2)
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t = float(theta[0])
@@ -155,7 +153,7 @@ def pitchfork() -> Example:
     return Example(
         name="pitchfork",
         tags=("tier1", "sosc", "pitchfork", "nonunique"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0),
         branches=branches,
         directions={"unfold": _a(1.0)},
@@ -180,10 +178,9 @@ def swallowtail() -> Example:
     genuinely transverse directions to cover.
     """
 
-    def build():
-        x = ca.SX.sym("x", 1)
-        th = ca.SX.sym("theta", 2)
-        return x, th, x[0] ** 4 / 4 - th[0] * x[0] ** 2 / 2 - th[1] * x[0], None, None
+    x = ca.SX.sym("x", 1)
+    th = ca.SX.sym("theta", 2)
+    nlp = DifferentiableNLP(x, th, x[0] ** 4 / 4 - th[0] * x[0] ** 2 / 2 - th[1] * x[0])
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t1, t2 = float(theta[0]), float(theta[1])
@@ -200,7 +197,7 @@ def swallowtail() -> Example:
     return Example(
         name="swallowtail",
         tags=("tier1", "sosc", "cusp", "twoparam"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0, 0.0),
         branches=branches,
         directions={"tilt": _a(0.0, 1.0), "split": _a(1.0, 0.0), "diag": _a(1.0, 1.0)},
@@ -235,11 +232,10 @@ def mixed_kernel(b: float = 1.0, c: float = 1.0, name: Optional[str] = None) -> 
                  dx1/dtheta = 1 / (1 + rho(1 + varrho) - rho b^2 / varrho).
     """
 
-    def build():
-        x = ca.SX.sym("x", 2)
-        th = ca.SX.sym("theta", 1)
-        f = 0.5 * x[0] ** 2 + b * x[0] * x[1] + (c / 6.0) * x[1] ** 3
-        return x, th, f, None, ca.vertcat(x[0] - th[0])
+    x = ca.SX.sym("x", 2)
+    th = ca.SX.sym("theta", 1)
+    f = 0.5 * x[0] ** 2 + b * x[0] * x[1] + (c / 6.0) * x[1] ** 3
+    nlp = DifferentiableNLP(x, th, f, h=ca.vertcat(x[0] - th[0]))
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t = float(theta[0])
@@ -273,7 +269,7 @@ def mixed_kernel(b: float = 1.0, c: float = 1.0, name: Optional[str] = None) -> 
         name=name or ("mixed_kernel_fold" if abs(c) > TOL else "mixed_kernel_quadratic"),
         tags=("tier2", "sosc", "mixed", "ratio_trap")
         + (("fold", "existence") if abs(c) > TOL else ("existence", "unbounded")),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0),
         branches=branches,
         directions={"unfold": _a(1.0)},
@@ -312,10 +308,11 @@ def licq_two_eq() -> Example:
             x_reg = (theta1 + theta2) / (2 + rho(1 + varrho)).
     """
 
-    def build():
-        x = ca.SX.sym("x", 1)
-        th = ca.SX.sym("theta", 2)
-        return x, th, 0.5 * x[0] ** 2, None, ca.vertcat(x[0] - th[0], x[0] - th[1])
+    x = ca.SX.sym("x", 1)
+    th = ca.SX.sym("theta", 2)
+    nlp = DifferentiableNLP(
+        x, th, 0.5 * x[0] ** 2, h=ca.vertcat(x[0] - th[0], x[0] - th[1])
+    )
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t1, t2 = float(theta[0]), float(theta[1])
@@ -344,7 +341,7 @@ def licq_two_eq() -> Example:
     return Example(
         name="licq_two_eq",
         tags=("tier2", "licq", "infeasible", "nonunique_dual"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0, 0.0),
         branches=branches,
         directions={"compatible": _a(1.0, 1.0), "incompatible": _a(1.0, -1.0)},
@@ -384,12 +381,11 @@ def tangency(kappa: float = 0.5, multiplier: Optional[float] = None) -> Example:
     """
     lam1_bar = kappa / 2.0 if multiplier is None else multiplier
 
-    def build():
-        x = ca.SX.sym("x", 2)
-        th = ca.SX.sym("theta", 1)
-        f = -x[1] - 0.5 * kappa * x[0] ** 2
-        g = ca.vertcat(x[0] ** 2 + (x[1] - 1.0) ** 2 - 1.0, x[1] - 2.0 - th[0])
-        return x, th, f, g, None
+    x = ca.SX.sym("x", 2)
+    th = ca.SX.sym("theta", 1)
+    f = -x[1] - 0.5 * kappa * x[0] ** 2
+    g = ca.vertcat(x[0] ** 2 + (x[1] - 1.0) ** 2 - 1.0, x[1] - 2.0 - th[0])
+    nlp = DifferentiableNLP(x, th, f, g=g)
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t = float(theta[0])
@@ -413,7 +409,7 @@ def tangency(kappa: float = 0.5, multiplier: Optional[float] = None) -> Example:
     return Example(
         name="tangency",
         tags=("tier2", "licq", "sosc", "d2", "nonunique", "onesided"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0),
         branches=branches,
         directions={"tighten": _a(-1.0), "loosen": _a(1.0)},
@@ -443,12 +439,11 @@ def wachter_biegler() -> Example:
     reported here is regularisation bias or a bug, not degeneracy.
     """
 
-    def build():
-        x = ca.SX.sym("x", 3)
-        th = ca.SX.sym("theta", 2)
-        g = ca.vertcat(-x[1], -x[2])
-        h = ca.vertcat(x[0] ** 2 - x[1] - 1.0 - th[0], x[0] - x[2] - 0.5 - th[1])
-        return x, th, x[0], g, h
+    x = ca.SX.sym("x", 3)
+    th = ca.SX.sym("theta", 2)
+    g = ca.vertcat(-x[1], -x[2])
+    h = ca.vertcat(x[0] ** 2 - x[1] - 1.0 - th[0], x[0] - x[2] - 0.5 - th[1])
+    nlp = DifferentiableNLP(x, th, x[0], g=g, h=h)
 
     def branches(theta: np.ndarray, at: Factory) -> List[NLPSolution]:
         t1, t2 = float(theta[0]), float(theta[1])
@@ -466,7 +461,7 @@ def wachter_biegler() -> Example:
     return Example(
         name="wachter_biegler",
         tags=("tier2", "control", "regular"),
-        build=build,
+        nlp=nlp,
         theta_bar=_a(0.0, 0.0),
         branches=branches,
         directions={"eq1": _a(1.0, 0.0), "eq2": _a(0.0, 1.0), "diag": _a(1.0, 1.0)},
@@ -509,19 +504,21 @@ EXPECTED: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {
 }
 
 
-#: which hypotheses are meant to fail at each reference point.  Checked against
-#: what ``adapter.solution_properties`` actually measures, so a mis-specified
-#: example (wrong multiplier, wrong base point) cannot pass silently.
+#: which hypotheses are meant to fail at each reference point.  Keys match
+#: ``DifferentiableNLP.check_properties``; ``dim_kernel`` is added by
+#: ``Example.phi_bar``.  Checked against what is actually measured, so a
+#: mis-specified example (wrong multiplier, wrong base point) cannot pass
+#: silently -- which is the whole point of a degeneracy test suite.
 EXPECTED_PROPERTIES: Dict[str, Dict[str, object]] = {
-    "fold":                   {"licq": True,  "sosc": False, "dim_kernel": 1},
-    "cusp":                   {"licq": True,  "sosc": False, "dim_kernel": 1},
-    "pitchfork":              {"licq": True,  "sosc": False, "dim_kernel": 1},
-    "swallowtail":            {"licq": True,  "sosc": False, "dim_kernel": 1},
-    "mixed_kernel_fold":      {"licq": True,  "sosc": False, "dim_kernel": 1},
-    "mixed_kernel_quadratic": {"licq": True,  "sosc": False, "dim_kernel": 1},
-    "licq_two_eq":            {"licq": False, "sosc": True,  "dim_kernel": 1},
-    "tangency":               {"licq": False, "sosc": False, "dim_kernel": 2},
-    "wachter_biegler":        {"licq": True,  "sosc": True,  "dim_kernel": 0},
+    "fold":                   {"licq": True,  "scs": True, "sosc": False, "dim_kernel": 1},
+    "cusp":                   {"licq": True,  "scs": True, "sosc": False, "dim_kernel": 1},
+    "pitchfork":              {"licq": True,  "scs": True, "sosc": False, "dim_kernel": 1},
+    "swallowtail":            {"licq": True,  "scs": True, "sosc": False, "dim_kernel": 1},
+    "mixed_kernel_fold":      {"licq": True,  "scs": True, "sosc": False, "dim_kernel": 1},
+    "mixed_kernel_quadratic": {"licq": True,  "scs": True, "sosc": False, "dim_kernel": 1},
+    "licq_two_eq":            {"licq": False, "scs": True, "sosc": True,  "dim_kernel": 1},
+    "tangency":               {"licq": False, "scs": True, "sosc": False, "dim_kernel": 2},
+    "wachter_biegler":        {"licq": True,  "scs": True, "sosc": True,  "dim_kernel": 0},
 }
 
 

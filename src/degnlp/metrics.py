@@ -16,17 +16,15 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import casadi as ca
 import numpy as np
 
-from .adapter import residual_norm
 from .core import (
     Example,
-    coerce_jac,
-    distance_to_set,
     kind_of,
     loglog_slope,
     phi_np,
     select_branch,
+    stack_sensitivities,
 )
-from .types import JacLike, NLPSolution, to_np
+from .types import NLPSolution, Sensitivities, to_np
 
 DEFAULT_TS = np.geomspace(1e-1, 1e-6, 13)
 TINY = 1e-300
@@ -212,13 +210,14 @@ def _classify(slope: float, true_slope: float, exists: bool) -> str:
 
 def taylor(
     example: Example,
-    jac: JacLike,
+    jac: Sensitivities,
     direction=None,
     ts: Sequence[float] = DEFAULT_TS,
     block: str = "x",
     kind: Optional[str] = "min",
     tol: float = 0.25,
     fit_last: int = 6,
+    noise_floor: float = 1e-13,
 ) -> Taylor:
     """Compare the first-order prediction ``phi_bar + t J d`` against truth.
 
@@ -230,9 +229,7 @@ def taylor(
     """
     name, d = _dir(example, direction)
     dim, phibar = example.dims, example.phi_bar_np
-    J = coerce_jac(jac, dim)
-    Jb = dim.rows(J, block)
-    usable = bool(np.isfinite(Jb).all())
+    Jb = dim.rows(stack_sensitivities(jac, dim), block)
 
     tab = Table(("t", "sign", "exists", "|d phi|", "|pred|", "err", "err_set", "rel"))
     errs: Dict[str, List[Tuple[float, float]]] = {"+": [], "-": []}
@@ -244,7 +241,7 @@ def taylor(
         for s in (+1.0, -1.0):
             key = "+" if s > 0 else "-"
             dtheta = s * t * d
-            pred = Jb @ dtheta if usable else np.full(Jb.shape[0], np.nan)
+            pred = Jb @ dtheta
             points = example.solve(example.theta_bar + dtheta)
             if not points:
                 tab.rows.append({"t": float(t), "sign": key, "exists": False,
@@ -257,10 +254,14 @@ def taylor(
             err = float(np.linalg.norm(true_step - pred))
             pred_phi = phibar.copy()
             pred_phi[dim.blocks[block]] = dim.rows(phibar, block) + pred
-            err_set = distance_to_set(points, pred_phi, dim, kind=kind, block=block)
+            nearest = select_branch(points, pred_phi, dim, kind=kind, block=block)
+            err_set = float(
+                np.linalg.norm(dim.rows(phi_np(nearest), block) - dim.rows(pred_phi, block))
+            )
             nt = float(np.linalg.norm(true_step))
             rel = err / max(nt, TINY)
-            errs[key].append((float(t), err))
+            if err > noise_floor * max(1.0, nt):
+                errs[key].append((float(t), err))
             trues[key].append((float(t), nt))
             rels[key].append((float(t), rel))
             tab.rows.append({"t": float(t), "sign": key, "exists": True,
@@ -307,7 +308,7 @@ class Asymmetry:
 
 def asymmetry(
     example: Example,
-    jac: JacLike,
+    jac: Sensitivities,
     direction=None,
     t: float = 1e-4,
     block: str = "x",
@@ -321,7 +322,7 @@ def asymmetry(
     """
     name, d = _dir(example, direction)
     dim, phibar = example.dims, example.phi_bar_np
-    Jd = dim.rows(coerce_jac(jac, dim) @ d, block)
+    Jd = dim.rows(stack_sensitivities(jac, dim) @ d, block)
 
     def side(s: float) -> Optional[np.ndarray]:
         points = example.solve(example.theta_bar + s * t * d)
@@ -355,7 +356,7 @@ def asymmetry(
 # ---------------------------------------------------------------------------
 def step_residual(
     example: Example,
-    jac: JacLike,
+    jac: Sensitivities,
     direction=None,
     ts: Sequence[float] = (1e-1, 1e-2, 1e-3, 1e-4),
     kind: Optional[str] = "min",
@@ -367,7 +368,7 @@ def step_residual(
     """
     name, d = _dir(example, direction)
     dim, phibar = example.dims, example.phi_bar_np
-    J = np.nan_to_num(coerce_jac(jac, dim), nan=0.0)
+    J = np.nan_to_num(stack_sensitivities(jac, dim), nan=0.0)
     tab = Table(("t", "sign", "res_frozen", "res_pred", "ratio", "res_true"))
     for t in ts:
         for s in (+1.0, -1.0):
@@ -376,7 +377,7 @@ def step_residual(
             r1 = residual_at(example, phibar + J @ (s * t * d), theta)
             points = example.solve(theta)
             rt = (
-                residual_norm(select_branch(points, phibar, dim, kind=kind).kkt_residuals)
+                example.residual_phi(phi_np(select_branch(points, phibar, dim, kind=kind)), theta)
                 if points else np.nan
             )
             tab.rows.append({"t": float(t), "sign": "+" if s > 0 else "-",
@@ -407,7 +408,7 @@ class LossGradient:
 
 def loss_gradient(
     example: Example,
-    jac: JacLike,
+    jac: Sensitivities,
     loss: Callable[[np.ndarray], float],
     t: float = 1e-4,
     kind: Optional[str] = "min",
@@ -419,7 +420,7 @@ def loss_gradient(
     50% relative error but cosine ~1 is still a descent direction.
     """
     dim, phibar = example.dims, example.phi_bar_np
-    J = np.nan_to_num(coerce_jac(jac, dim), nan=0.0)
+    J = np.nan_to_num(stack_sensitivities(jac, dim), nan=0.0)
 
     gphi = np.zeros_like(phibar)
     for i in range(phibar.size):
@@ -490,7 +491,7 @@ class EpsSweep:
 
 def eps_sweep(
     example: Example,
-    jac_fn: Callable[[float], JacLike],
+    jac_fn: Callable[[float], Sensitivities],
     eps: Sequence[float] = (1e-1, 3e-2, 1e-2, 3e-3, 1e-3),
     direction=None,
     ts: Sequence[float] = DEFAULT_TS,
@@ -507,8 +508,9 @@ def eps_sweep(
     Jn, errs, tvals = [], [], []
 
     for e in eps:
-        J = coerce_jac(jac_fn(float(e)), example.dims)
-        rep = taylor(example, J, direction=d, ts=ts, block=block, kind=kind, tol=tol)
+        sens = jac_fn(float(e))
+        rep = taylor(example, sens, direction=d, ts=ts, block=block, kind=kind, tol=tol)
+        J = stack_sensitivities(sens, example.dims)
         if side == "auto":
             cand = [s for s in ("+", "-") if rep.exists[s]]
             s_use = cand[0] if cand else "+"
@@ -537,7 +539,7 @@ def eps_sweep(
 # 7. exactness check against a closed-form regularised Jacobian
 # ---------------------------------------------------------------------------
 def reg_jac_exactness(
-    example: Example, jac: JacLike, varrho: float, rho: float
+    example: Example, jac: Sensitivities, varrho: float, rho: float
 ) -> Optional[Dict[str, float]]:
     """For the quadratic examples the regularised KKT Jacobian is closed form.
 
@@ -551,7 +553,7 @@ def reg_jac_exactness(
     if fn is None:
         return None
     ref = np.asarray(fn(varrho, rho), dtype=float)
-    got = coerce_jac(jac, example.dims)
+    got = stack_sensitivities(jac, example.dims)
     mask = np.isfinite(got)
     if not mask.any():
         return None

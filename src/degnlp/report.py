@@ -15,14 +15,14 @@ import numpy as np
 
 from . import examples as ex_mod
 from . import metrics as M
-from .core import Example, coerce_jac
+from .core import Example, stack_sensitivities
 from .reference import FiniteDifferenceOracle
-from .types import ArrayLike, NLPSolution
+from .types import NLPSolution, Sensitivities
 
-Differentiate = Callable[[object, NLPSolution], ArrayLike]
+Differentiate = Callable[[object, NLPSolution], Sensitivities]
 
 
-def jacobian_for(differentiator: Differentiate, example: Example) -> ArrayLike:
+def jacobian_for(differentiator: Differentiate, example: Example) -> Sensitivities:
     """Call a differentiator on an example's NLP and reference solution.
 
     Differentiators that need the example itself (the finite-difference oracle)
@@ -103,7 +103,7 @@ def run_suite(
         suite.properties[ex.name] = dict(ex.phi_bar.properties or {})
         try:
             jac = jacobian_for(differentiator, ex)
-            coerce_jac(jac, ex.dims)
+            stack_sensitivities(jac, ex.dims)
         except Exception as exc:  # a differentiator may legitimately refuse
             suite.notes.append(f"{ex.name}: differentiator raised {exc!r}")
             continue
@@ -135,15 +135,15 @@ def validate_examples(
 
 
 def property_table(names: Optional[Sequence[str]] = None) -> str:
-    """Which hypotheses actually fail at each reference point, measured from
-    ``funcs.ift`` rather than asserted."""
+    """Which hypotheses actually fail at each reference point, as measured by
+    ``DifferentiableNLP.check_properties`` rather than asserted."""
     pool = [ex_mod.get(n) for n in names] if names else ex_mod.all_examples()
-    keys = ("licq", "strict_complementarity", "sosc", "kkt_nonsingular")
-    labels = ("LICQ", "strict comp", "SOSC", "K nonsing")
-    hdr = f"{'example':<24}" + "".join(f"{l:>14}" for l in labels) + f"{'dim ker K':>11}"
+    keys = ("licq", "scs", "sosc", "ssosc")
+    labels = ("LICQ", "SCS", "SOSC", "SSOSC")
+    hdr = f"{'example':<24}" + "".join(f"{l:>10}" for l in labels) + f"{'dim ker K':>11}"
     lines = [hdr, "-" * len(hdr)]
     for ex in pool:
         props = ex.phi_bar.properties or {}
-        cells = "".join(f"{('yes' if props.get(k) else 'NO'):>14}" for k in keys)
-        lines.append(f"{ex.name:<24}{cells}{ex.kernel_numeric().shape[1]:>11}")
+        cells = "".join(f"{('yes' if props.get(k) else 'NO'):>10}" for k in keys)
+        lines.append(f"{ex.name:<24}{cells}{props.get('dim_kernel', -1):>11}")
     return "\n".join(lines)

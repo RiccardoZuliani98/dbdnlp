@@ -9,14 +9,15 @@ import casadi as ca
 import numpy as np
 import pytest
 
-from degnlp import adapter
+from dbdnlp._impl.nlp import DifferentiableNLP
+
 from degnlp import examples as ex_mod
 from degnlp import metrics as M
 from degnlp import report
-from degnlp.core import kind_of, phi_np
-from degnlp.reference import FiniteDifferenceOracle, RegularizedKKT
+from degnlp.core import kind_of, phi_np, stack_sensitivities
+from degnlp.reference import IFT, FiniteDifferenceOracle, Regularized
 from degnlp.report import jacobian_for
-from degnlp.types import NLPSolution
+from degnlp.types import NLPSolution, to_np
 
 ALL = list(ex_mod.REGISTRY)
 
@@ -64,10 +65,11 @@ def test_reference_properties_are_measured(name):
     ex = ex_mod.get(name)
     props = ex.phi_bar.properties
     want = ex.ls["expected_properties"]
-    assert props["licq"] is want["licq"]
-    assert props["sosc"] is want["sosc"]
-    assert ex.kernel_numeric().shape[1] == want["dim_kernel"]
-    assert props["kkt_nonsingular"] is (want["dim_kernel"] == 0)
+    for key in ("licq", "scs", "sosc"):
+        assert props[key] is want[key], f"{name}: {key}"
+    assert props["dim_kernel"] == want["dim_kernel"]
+    assert (props["dim_kernel"] == 0) is (props["licq"] and props["ssosc"])
+    assert props["kkt_residual"] < 1e-9
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -79,17 +81,37 @@ def test_declared_hoelder_exponents(name):
             assert ok, f"{name}/{dname} side {side}: got {h.exponent[side]}, want {h.expected.get(side)}"
 
 
+def _amax(v) -> float:
+    """max |v|, zero for the empty vector (unconstrained examples)."""
+    v = np.asarray(v, dtype=float)
+    return float(np.max(np.abs(v))) if v.size else 0.0
+
+
 @pytest.mark.parametrize("name", ALL)
 def test_declared_kernel_is_a_kernel(name):
-    """K @ phi_k == 0 for the declared generators, K built from FD derivatives."""
+    """The declared generators really span ker K, and there are the right number
+    of them -- checked against ``check_properties['dim_kernel']``."""
     ex = ex_mod.get(name)
     declared = ex.kernel_matrix()
+    measured = ex.phi_bar.properties["dim_kernel"]
+    assert measured == declared.shape[1], f"{name}: kernel dimension mismatch"
     if declared.shape[1] == 0:
-        assert ex.kernel_numeric().shape[1] == 0
         return
-    K, _ = adapter.kkt_matrix(ex.nlp, ex.phi_bar, n_theta=ex.p)
-    assert np.max(np.abs(K @ declared)) < 1e-5, f"{name}: declared kernel is not in ker K"
-    assert ex.kernel_numeric().shape[1] == declared.shape[1], "kernel dimension mismatch"
+
+    # A generator (u, v) of ker K satisfies  H_xx u + J^T v = 0  and  J u = 0,
+    # written out from funcs.ift rather than from any assembled matrix.
+    s = ex.phi_bar
+    H, _, J_g, _, J_h, _ = ex.nlp.funcs.ift(s.x, s.lam, s.nu, s.theta)
+    H = to_np(H).reshape(ex.dims.n_x, ex.dims.n_x)
+    J = np.vstack([
+        to_np(J_g).reshape(ex.dims.n_ineq, ex.dims.n_x),
+        to_np(J_h).reshape(ex.dims.n_eq, ex.dims.n_x),
+    ])
+    for k in range(declared.shape[1]):
+        u = ex.dims.rows(declared[:, k], "x")
+        v = ex.dims.rows(declared[:, k], "dual")
+        assert _amax(H @ u + J.T @ v) < 1e-8, f"{name}: generator {k} stationarity"
+        assert _amax(J @ u) < 1e-8, f"{name}: generator {k} feasibility"
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +125,15 @@ def test_oracle_is_second_order_on_regular_example():
     assert "second order" in rep.verdict["+"]
 
 
+def _zeros(ex):
+    d = ex.dims
+    return {"x": np.zeros((d.n_x, d.n_theta)), "lam": np.zeros((d.n_ineq, d.n_theta)),
+            "nu": np.zeros((d.n_eq, d.n_theta))}
+
+
 def test_zero_jacobian_is_first_order_on_regular_example():
     ex = ex_mod.get("wachter_biegler")
-    J = np.zeros((ex.dims.n_phi, ex.p))
+    J = _zeros(ex)
     rep = M.taylor(ex, J, direction="eq1", block="x")
     assert 0.9 < rep.slope["+"] < 1.2
 
@@ -118,19 +146,32 @@ def test_fold_defeats_every_jacobian():
     """
     ex = ex_mod.get("fold")
     ts = np.geomspace(1e-4, 1e-12, 9)
-    for J in (np.zeros((1, 1)), np.array([[1.0]]), np.array([[1e3]])):
-        rep = M.taylor(ex, J, block="x", ts=ts)
-        assert rep.slope["+"] < 0.6, (J, rep.slope)
+    empty = {"lam": np.zeros((0, 1)), "nu": np.zeros((0, 1))}
+    for dx in (0.0, 1.0, 1e3):
+        rep = M.taylor(ex, {"x": np.array([[dx]]), **empty}, block="x", ts=ts)
+        assert rep.slope["+"] < 0.6, (dx, rep.slope)
         assert not np.isfinite(rep.true_slope["-"])   # no solution on that side
 
 
-def test_partial_jacobian_is_accepted():
-    """A differentiator that only produces dx/dtheta is still testable."""
+def test_contract_is_enforced():
+    """All three blocks are required; a partial answer is an error, not a
+    silently-zeroed row."""
     ex = ex_mod.get("licq_two_eq")
-    exact = M.taylor(ex, {"x": np.array([[0.5, 0.5]])}, direction="compatible", block="x")
-    assert "exact" in exact.verdict["+"]
-    wrong = M.taylor(ex, {"x": np.array([[0.5, 0.4]])}, direction="compatible", block="x")
-    assert 0.9 < wrong.slope["+"] < 1.2
+    full = {"x": np.array([[0.5, 0.5]]), "lam": np.zeros((0, 2)), "nu": np.zeros((2, 2))}
+    assert "exact" in M.taylor(ex, full, direction="compatible", block="x").verdict["+"]
+    with pytest.raises(KeyError):
+        M.taylor(ex, {"x": np.array([[0.5, 0.5]])}, direction="compatible")
+    with pytest.raises(ValueError):
+        M.taylor(ex, {**full, "nu": np.zeros((5, 2))}, direction="compatible")
+
+
+def test_nan_blocks_propagate_rather_than_read_as_zero():
+    """A differentiator reporting NaN must not be scored as if it said zero."""
+    ex = ex_mod.get("licq_two_eq")
+    nan = {"x": np.full((1, 2), np.nan), "lam": np.zeros((0, 2)), "nu": np.zeros((2, 2))}
+    rep = M.taylor(ex, nan, direction="compatible", block="x")
+    assert not np.isfinite(rep.slope["+"])
+    assert all(not np.isfinite(r["err"]) for r in rep.table.rows if r["exists"])
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +181,7 @@ def test_partial_jacobian_is_accepted():
 def test_reference_kkt_matches_closed_form(name):
     ex = ex_mod.get(name)
     varrho, rho = 1e-2, 1e-3
-    J = jacobian_for(RegularizedKKT(varrho=varrho, rho=rho), ex)
+    J = jacobian_for(Regularized(rho_1=varrho, rho_2=rho), ex)
     out = M.reg_jac_exactness(ex, J, varrho, rho)
     assert out is not None and out["rel_err"] < 1e-5, out
 
@@ -151,7 +192,7 @@ def test_ratio_trap_is_singular_at_the_predicted_ratio():
     rho = 1e-4
     norms = {}
     for ratio in (0.25 * b2, b2, 4.0 * b2):
-        J = jacobian_for(RegularizedKKT(varrho=ratio * rho, rho=rho), ex)
+        J = stack_sensitivities(jacobian_for(Regularized(rho_1=ratio * rho, rho_2=rho), ex), ex.dims)
         norms[ratio] = np.linalg.norm(J)
     assert norms[b2] > 10 * norms[0.25 * b2]
     assert norms[b2] > 10 * norms[4.0 * b2]
@@ -164,7 +205,7 @@ def test_fold_saturation_and_knee_orders():
     ex = ex_mod.get("fold")
     sweep = M.eps_sweep(
         ex,
-        lambda e: jacobian_for(RegularizedKKT(varrho=e, rho=e), ex),
+        lambda e: jacobian_for(Regularized(rho_1=e, rho_2=e), ex),
         eps=(1e-1, 3e-2, 1e-2, 3e-3, 1e-3),
         ts=np.geomspace(1e-2, 1e-10, 17),
         side="+",
@@ -194,7 +235,7 @@ def test_relaxed_solution_bias_licq():
 
 
 def test_suite_runs_end_to_end():
-    s = report.run_suite(RegularizedKKT(varrho=1e-3, rho=1e-3))
+    s = report.run_suite(Regularized(rho_1=1e-3, rho_2=1e-3))
     assert s.rows
     assert max(s.self_check.values()) < 1e-6
 
@@ -202,28 +243,47 @@ def test_suite_runs_end_to_end():
 # ---------------------------------------------------------------------------
 # the NLP factory is swappable
 # ---------------------------------------------------------------------------
-def test_factory_hook_is_used():
-    """Installing a project factory must be the only change needed."""
-    seen = []
-
-    def factory(primal, param, cost, ineq, eq):
-        seen.append(cost)
-        return adapter._default_factory(primal, param, cost, ineq, eq)
-
-    adapter.set_factory(factory)
-    try:
-        ex = ex_mod.get("fold")
-        _ = ex.nlp
-        assert len(seen) == 1
-        assert ex.check_reference_point() < 1e-6
-    finally:
-        adapter.reset_factory()
+@pytest.mark.parametrize("name", ALL)
+def test_example_carries_a_differentiable_nlp(name):
+    """Each example owns a constructed DifferentiableNLP, and Dims agrees with it."""
+    ex = ex_mod.get(name)
+    assert isinstance(ex.nlp, DifferentiableNLP)
+    assert (ex.nlp.n_x, ex.nlp.n_ineq, ex.nlp.n_eq, ex.nlp.n_theta) == (
+        ex.dims.n_x, ex.dims.n_ineq, ex.dims.n_eq, ex.dims.n_theta
+    )
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_jacobian_accepts_casadi_dm(name):
+def test_differentiate_dict_is_consumed_directly(name):
+    """differentiate() returns {'x','lam','nu'}; the harness must take it as is."""
     ex = ex_mod.get(name)
-    J = jacobian_for(RegularizedKKT(varrho=1e-2, rho=1e-2), ex)
-    from degnlp.core import coerce_jac
+    out = ex.nlp.differentiate(
+        ex.phi_bar.theta, ex.phi_bar.x, ex.phi_bar.lam, ex.phi_bar.nu,
+        mode="regularized", options={"rho_1": 1e-2, "rho_2": 1e-2},
+    )
+    assert set(out) == {"x", "lam", "nu"}
+    assert stack_sensitivities(out, ex.dims).shape == (ex.dims.n_phi, ex.dims.n_theta)
 
-    assert np.allclose(coerce_jac(ca.DM(J), ex.dims), coerce_jac(J, ex.dims))
+
+def test_evaluate_round_trips_a_point():
+    """DifferentiableNLP.evaluate must package an arbitrary point, empty
+    multiplier blocks included."""
+    ex = ex_mod.get("fold")
+    sol = ex.nlp.evaluate([0.25], [0.5])
+    assert isinstance(sol, NLPSolution)
+    assert sol.lam.shape == (0, 1) and sol.nu.shape == (0, 1)
+    assert np.max(np.abs(to_np(sol.kkt_residuals["stationarity"]))) < 1e-12
+    with pytest.raises(ValueError):
+        ex.nlp.evaluate([0.0], [0.0, 0.0])
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_sensitivity_blocks_stack_in_phi_order(name):
+    ex = ex_mod.get(name)
+    sens = jacobian_for(Regularized(rho_1=1e-2, rho_2=1e-2), ex)
+    J = stack_sensitivities(sens, ex.dims)
+    d = ex.dims
+    assert J.shape == (d.n_phi, d.n_theta)
+    for key in ("x", "lam", "nu"):
+        block = to_np(sens[key]).reshape(-1)
+        assert np.allclose(d.rows(J, key).reshape(-1), block)
