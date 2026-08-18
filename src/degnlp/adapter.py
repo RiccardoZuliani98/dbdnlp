@@ -47,6 +47,7 @@ Builder = Callable[
 # ---------------------------------------------------------------------------
 # symbolic + compiled function construction
 # ---------------------------------------------------------------------------
+# TODO: redundant, can be pulled directly from DifferentiableNLP
 def build_symbolic(
     primal: Symbolic,
     param: Symbolic,
@@ -73,7 +74,7 @@ def build_symbolic(
         dual_cst=ca.vertcat(dual_ineq, dual_eq),
     )
 
-
+#TODO: this is redundant and can be pulled from DifferentiableNLP directly
 def build_functions(sym: NLPSymbolic) -> NLPFunctions:
     """Compile the :class:`NLPFunctions` bundle for a symbolic NLP."""
     x, th = sym.primal, sym.param
@@ -130,6 +131,7 @@ def build_functions(sym: NLPSymbolic) -> NLPFunctions:
 # ---------------------------------------------------------------------------
 # the NLP object
 # ---------------------------------------------------------------------------
+# TODO: I can add these to NLP and get rid of this
 @dataclass(frozen=True)
 class ReferenceNLP:
     """Minimal stand-in for ``DifferentiableNLP``: symbolics, compiled
@@ -191,13 +193,14 @@ def make_nlp(build: Builder):
 # ---------------------------------------------------------------------------
 # evaluation helpers (positional calls: works for any ca.Function)
 # ---------------------------------------------------------------------------
+# TODO: this can be merged to NLP
 def _dims(nlp, n_theta: Optional[int] = None) -> Tuple[int, int, int, int]:
     n_th = getattr(nlp, "n_theta", None) if n_theta is None else n_theta
     if n_th is None:
         n_th = int(nlp.sym.param.numel())
     return int(nlp.n_x), int(nlp.n_ineq), int(nlp.n_eq), int(n_th)
 
-
+# TODO: this function and the next are also redundant
 def eval_kkt(nlp, x, lam, nu, theta) -> Dict[str, ca.DM]:
     """``funcs.kkt`` as a dict, in the documented output order."""
     n_x, n_ineq, n_eq, n_theta = _dims(nlp)
@@ -215,7 +218,7 @@ def residual_norm(residuals: Dict[str, ca.DM]) -> float:
     parts = [p for p in parts if p.size] or [np.zeros(1)]
     return float(np.linalg.norm(np.concatenate(parts)))
 
-
+#TODO: I think this is redundant
 def eval_ift(nlp, solution: NLPSolution, n_theta: Optional[int] = None) -> Dict[str, np.ndarray]:
     """``funcs.ift`` at a solution, returned with exact shapes."""
     n_x, n_ineq, n_eq, n_th = _dims(nlp, n_theta)
@@ -232,7 +235,7 @@ def eval_ift(nlp, solution: NLPSolution, n_theta: Optional[int] = None) -> Dict[
     ]
     return {k: mat(v, *s) for k, v, s in zip(keys, vals, shapes)}
 
-
+# TODO: this can also be returned elsewhere
 def active_set(nlp, solution: NLPSolution, tol: float = 1e-8) -> np.ndarray:
     n_x, n_ineq, n_eq, n_th = _dims(nlp)
     if n_ineq == 0:
@@ -244,6 +247,9 @@ def active_set(nlp, solution: NLPSolution, tol: float = 1e-8) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # KKT matrix, kernel, degeneracy flags
 # ---------------------------------------------------------------------------
+# TODO: also redundant since it can be generated using the standard NLP
+# differentiator on the regularized problem.
+# TODO: also, everything should be differentiator-agnostic.
 def kkt_matrix(
     nlp,
     solution: NLPSolution,
@@ -286,7 +292,7 @@ def kkt_matrix(
         rhs[n_x + na :] = -d["J_htheta"]
     return K, rhs
 
-
+#TODO: this belongs elsewhere
 def kernel_basis(
     nlp, solution: NLPSolution, tol: float = 1e-8, active: Optional[np.ndarray] = None
 ) -> np.ndarray:
@@ -298,7 +304,8 @@ def kernel_basis(
     cols = [Vt[i] for i in range(s.size) if s[i] <= tol * max(1.0, s[0])]
     return np.stack(cols, axis=1) if cols else np.zeros((K.shape[0], 0))
 
-
+# TODO: redundant, this already exists inside the NLP
+# TODO: I'll make this an external helper that I can pull into NLP or wherever.
 def solution_properties(nlp, solution: NLPSolution, tol: float = 1e-8) -> Dict[str, object]:
     """LICQ, strict complementarity, SOSC, and nonsingularity of the primal-dual
     matrix -- i.e. exactly the hypotheses the IFT needs.  Suitable for
