@@ -5,13 +5,18 @@ Run with:  pytest -q
 
 from __future__ import annotations
 
+import casadi as ca
 import numpy as np
 import pytest
 
+from degnlp import adapter
 from degnlp import examples as ex_mod
 from degnlp import metrics as M
 from degnlp import report
+from degnlp.core import kind_of, phi_np
 from degnlp.reference import FiniteDifferenceOracle, RegularizedKKT
+from degnlp.report import jacobian_for
+from degnlp.types import NLPSolution
 
 ALL = list(ex_mod.REGISTRY)
 
@@ -28,10 +33,41 @@ def test_reference_point_is_kkt(name):
 @pytest.mark.parametrize("name", ALL)
 def test_solve_reproduces_reference_point(name):
     ex = ex_mod.get(name)
-    branches = ex.solve_at(ex.theta_bar)
+    branches = ex.solve(ex.theta_bar)
     assert branches, "solve() must return the base point at theta_bar"
-    d = min(np.linalg.norm(b.x - ex.phi_bar.x) for b in branches)
-    assert d < 1e-9
+    xbar = np.asarray(ex.reference[0], dtype=float)
+    assert min(np.linalg.norm(np.asarray(b.x).reshape(-1) - xbar) for b in branches) < 1e-9
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_solutions_are_nlpsolutions_with_kind(name):
+    """Branches must be usable anywhere an NLPSolution is expected, and carry
+    their second-order label in ``properties``."""
+    ex = ex_mod.get(name)
+    for sol in ex.solve(ex.theta_bar):
+        assert isinstance(sol, NLPSolution)
+        assert kind_of(sol) != "unknown"
+        assert set(sol.kkt_residuals) == {
+            "stationarity", "inequality", "equality", "slackness", "dual_feasibility",
+        }
+        assert phi_np(sol).size == ex.dims.n_phi
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_reference_properties_are_measured(name):
+    """LICQ/SOSC/nonsingularity come from funcs.ift, not from assertion.
+
+    This is the check that catches a mis-specified base point: pick the wrong
+    multiplier out of a degenerate multiplier set and the measured kernel
+    dimension stops matching the declared one.
+    """
+    ex = ex_mod.get(name)
+    props = ex.phi_bar.properties
+    want = ex.ls["expected_properties"]
+    assert props["licq"] is want["licq"]
+    assert props["sosc"] is want["sosc"]
+    assert ex.kernel_numeric().shape[1] == want["dim_kernel"]
+    assert props["kkt_nonsingular"] is (want["dim_kernel"] == 0)
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -47,24 +83,13 @@ def test_declared_hoelder_exponents(name):
 def test_declared_kernel_is_a_kernel(name):
     """K @ phi_k == 0 for the declared generators, K built from FD derivatives."""
     ex = ex_mod.get(name)
-    Nmat = ex.kernel_matrix()
-    if Nmat.shape[1] == 0:
+    declared = ex.kernel_matrix()
+    if declared.shape[1] == 0:
+        assert ex.kernel_numeric().shape[1] == 0
         return
-    lay, fns = ex.layout, ex.functions
-    th, x = ex.theta_bar, ex.phi_bar.x
-    lam, nu = ex.phi_bar.lam, ex.phi_bar.nu
-    H = fns.hess_xx_L(x, lam, nu, th)
-    G = fns.jac_g(x, th)
-    A = fns.jac_h(x, th)
-    K = np.zeros((lay.size, lay.size))
-    K[: lay.n, : lay.n] = H
-    if lay.m_g:
-        K[: lay.n, lay.blocks["lam"]] = G.T
-        K[lay.blocks["lam"], : lay.n] = G
-    if lay.m_h:
-        K[: lay.n, lay.blocks["nu"]] = A.T
-        K[lay.blocks["nu"], : lay.n] = A
-    assert np.max(np.abs(K @ Nmat)) < 1e-5, f"{name}: declared kernel is not in ker K"
+    K, _ = adapter.kkt_matrix(ex.nlp, ex.phi_bar, n_theta=ex.p)
+    assert np.max(np.abs(K @ declared)) < 1e-5, f"{name}: declared kernel is not in ker K"
+    assert ex.kernel_numeric().shape[1] == declared.shape[1], "kernel dimension mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +97,7 @@ def test_declared_kernel_is_a_kernel(name):
 # ---------------------------------------------------------------------------
 def test_oracle_is_second_order_on_regular_example():
     ex = ex_mod.get("wachter_biegler")
-    J = FiniteDifferenceOracle(t=1e-6)(ex)
+    J = jacobian_for(FiniteDifferenceOracle(t=1e-6), ex)
     rep = M.taylor(ex, J, direction="eq1", block="x")
     assert rep.slope["+"] > 1.5
     assert "second order" in rep.verdict["+"]
@@ -80,7 +105,7 @@ def test_oracle_is_second_order_on_regular_example():
 
 def test_zero_jacobian_is_first_order_on_regular_example():
     ex = ex_mod.get("wachter_biegler")
-    J = np.zeros((ex.layout.size, ex.p))
+    J = np.zeros((ex.dims.n_phi, ex.p))
     rep = M.taylor(ex, J, direction="eq1", block="x")
     assert 0.9 < rep.slope["+"] < 1.2
 
@@ -115,7 +140,7 @@ def test_partial_jacobian_is_accepted():
 def test_reference_kkt_matches_closed_form(name):
     ex = ex_mod.get(name)
     varrho, rho = 1e-2, 1e-3
-    J = RegularizedKKT(varrho=varrho, rho=rho)(ex)
+    J = jacobian_for(RegularizedKKT(varrho=varrho, rho=rho), ex)
     out = M.reg_jac_exactness(ex, J, varrho, rho)
     assert out is not None and out["rel_err"] < 1e-5, out
 
@@ -126,7 +151,7 @@ def test_ratio_trap_is_singular_at_the_predicted_ratio():
     rho = 1e-4
     norms = {}
     for ratio in (0.25 * b2, b2, 4.0 * b2):
-        J = RegularizedKKT(varrho=ratio * rho, rho=rho)(ex)
+        J = jacobian_for(RegularizedKKT(varrho=ratio * rho, rho=rho), ex)
         norms[ratio] = np.linalg.norm(J)
     assert norms[b2] > 10 * norms[0.25 * b2]
     assert norms[b2] > 10 * norms[4.0 * b2]
@@ -139,7 +164,7 @@ def test_fold_saturation_and_knee_orders():
     ex = ex_mod.get("fold")
     sweep = M.eps_sweep(
         ex,
-        lambda e: RegularizedKKT(varrho=e, rho=e)(ex),
+        lambda e: jacobian_for(RegularizedKKT(varrho=e, rho=e), ex),
         eps=(1e-1, 3e-2, 1e-2, 3e-3, 1e-3),
         ts=np.geomspace(1e-2, 1e-10, 17),
         side="+",
@@ -164,7 +189,7 @@ def test_relaxed_solution_bias_licq():
     for e in (1e-2, 1e-3):
         theta = ex.theta_bar + 1e-3 * d
         x = relaxed(theta, e, e)
-        viol = np.abs(ex.functions.hval(np.array([x]), theta))
+        viol = np.abs(np.asarray(ex.nlp.funcs.eq(x, theta)).reshape(-1))
         assert np.max(viol) > 1e-5
 
 
@@ -175,16 +200,30 @@ def test_suite_runs_end_to_end():
 
 
 # ---------------------------------------------------------------------------
-# optional symbolic mirror
+# the NLP factory is swappable
 # ---------------------------------------------------------------------------
-casadi = pytest.importorskip("casadi", reason="casadi not installed")
+def test_factory_hook_is_used():
+    """Installing a project factory must be the only change needed."""
+    seen = []
+
+    def factory(primal, param, cost, ineq, eq):
+        seen.append(cost)
+        return adapter._default_factory(primal, param, cost, ineq, eq)
+
+    adapter.set_factory(factory)
+    try:
+        ex = ex_mod.get("fold")
+        _ = ex.nlp
+        assert len(seen) == 1
+        assert ex.check_reference_point() < 1e-6
+    finally:
+        adapter.reset_factory()
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_symbolic_matches_numeric(name):
-    from degnlp import symbolic
-
+def test_jacobian_accepts_casadi_dm(name):
     ex = ex_mod.get(name)
-    assert ex.build is not None
-    out = symbolic.validate(ex)
-    assert max(out.values()) < 1e-5, out
+    J = jacobian_for(RegularizedKKT(varrho=1e-2, rho=1e-2), ex)
+    from degnlp.core import coerce_jac
+
+    assert np.allclose(coerce_jac(ca.DM(J), ex.dims), coerce_jac(J, ex.dims))

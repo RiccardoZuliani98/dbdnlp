@@ -1,67 +1,90 @@
 # degnlp — degenerate parametric NLPs + a differentiator-agnostic harness
 
 Tiers 1 and 2 of the test plan: scalar catastrophe normal forms and
-constraint-side degeneracies, each with an **analytic solution map**, plus a
-harness whose only contract with your code is a numeric Jacobian.
+constraint-side degeneracies, each with an **analytic solution map**, built on
+your `NLPSolution` / `NLPSymbolic` / `NLPFunctions` types.
 
 ```
 degnlp/
-  core.py       Layout, Branch, Functions, Example; Jacobian coercion; branch selection
-  examples.py   the 9 examples + declared exponents + registry
-  metrics.py    every check; all of them consume a plain array
-  reference.py  baseline differentiators (regularised KKT, pinv, FD oracle)
-  report.py     run_suite / validate_examples
-  symbolic.py   optional CasADi mirrors + a transcription check
-tests/          56 tests, `pytest -q`
+  types.py      imports your types (falls back to a vendored copy); DM<->numpy helpers
+  adapter.py    NLPSymbolic/NLPFunctions construction, the NLP_FACTORY hook,
+                KKT matrix, kernel basis, LICQ/SOSC/strict-complementarity analysis
+  core.py       Dims, make_solution, Example, branch selection, coerce_jac
+  examples.py   the 9 examples, declared exponents and properties, registry
+  metrics.py    every check; all of them consume a plain Jacobian
+  reference.py  baseline differentiators (regularised KKT, least-squares, FD oracle)
+  report.py     run_suite / validate_examples / property_table
+tests/          75 tests, `pytest -q`
 demo.py         end-to-end walk-through
 ```
 
-No hard dependency beyond numpy. CasADi is optional and only used by
-`symbolic.py`.
+## Wiring it to the project
 
-## The contract
+Two hooks, both one-liners.
+
+**1. Types.** `types.py` tries `dbdnlp._impl.types` first and falls back to the
+vendored `_types_vendored.py` (your `types_new.py`, verbatim). Fix `_CANDIDATES`
+if the module path differs and the vendored copy stops being used. `TYPES_SOURCE`
+reports which one is live.
+
+**2. The NLP object.** Examples describe themselves as CasADi builders
+`() -> (primal, param, cost, ineq, eq)` and construct `Example.nlp` through
+`adapter.NLP_FACTORY`:
 
 ```python
-Differentiator = Callable[[Example], Array]   # -> shape (n + m_g + m_h, p)
+from dbdnlp._impl.nlp import DifferentiableNLP
+from degnlp import adapter
+
+adapter.set_factory(lambda primal, param, cost, ineq, eq: DifferentiableNLP(...))
 ```
 
-That is all. `coerce_jac` also accepts
+The default factory returns `ReferenceNLP`, a minimal stand-in exposing exactly
+the surface the harness uses — `sym`, `funcs`, `n_x`, `n_ineq`, `n_eq`,
+`n_theta` — so everything runs today and swaps over without touching the
+examples. `test_factory_hook_is_used` pins that contract.
 
-* an `(n, p)` array — read as the `x` block, duals treated as unreported,
-* a dict with any of `{"x", "lam", "nu"}`,
-* any object with `.jac` / `.jacobian` / `.J`.
+Everything downstream calls `nlp.funcs.kkt` and `nlp.funcs.ift` **positionally**,
+in the documented output order, so any object with those two `ca.Function`s and
+the dimension attributes works.
 
-Unreported rows become `NaN` and are skipped, so a method that only produces
-`dx/dtheta` is still fully testable on the primal blocks. Nothing else about
-your differentiator is observable to the tests.
+## The differentiator contract
 
-### Plugging in `DifferentiableNLP`
+```python
+Differentiator = Callable[[nlp, NLPSolution], ArrayLike]   # (n_phi, n_theta)
+```
+
+`coerce_jac` also accepts an `(n_x, n_theta)` block, a dict keyed by
+`x`/`lam`/`nu`, a `ca.DM`, or an object with `.jac`/`.jacobian`/`.J`. Unreported
+rows stay NaN and are skipped, so a method that only produces `dx/dtheta` is
+still fully testable on the primal block.
 
 ```python
 from degnlp import examples, metrics, report
 
-def my_diff(ex, varrho=1e-3, rho=1e-3):
-    x, th, f, g, h = ex.build()                 # CasADi mirror of the example
-    nlp = DifferentiableNLP(x, th, f, g, h)     # your class
-    eta = nlp.solve(ex.theta_bar, phi0=ex.phi_bar.phi)
-    return nlp.differentiate(eta, varrho=varrho, rho=rho)   # -> (n+m_g+m_h, p)
+def my_diff(nlp, solution, varrho=1e-3, rho=1e-3):
+    return nlp.differentiate(solution, varrho=varrho, rho=rho)
 
+my_diff.name = "P2"
 print(report.run_suite(my_diff))
+
 ex = examples.get("fold")
-print(metrics.eps_sweep(ex, lambda e: my_diff(ex, e, e), side="+"))
+print(metrics.eps_sweep(ex, lambda e: my_diff(ex.nlp, ex.phi_bar, e, e), side="+"))
 ```
 
-Two things worth doing before trusting any number:
+Run `metrics.reg_jac_exactness(ex, J, varrho, rho)` on `licq_two_eq` and
+`mixed_kernel_quadratic` before interpreting anything else — there the
+regularised KKT Jacobian is closed form, so a discrepancy is a bug. Those closed
+forms assume the plain `K + diag(varrho I, -rho I)` system; your P2 carries a
+slack `z` and a *theta-dependent* proximal centre `g_theta(xbar)`, so a mismatch
+confined to the `d_theta` columns points straight at that term.
 
-1. `symbolic.validate(ex)` — confirms the CasADi and numpy descriptions of the
-   same example agree at the base point, so a transcription slip cannot be
-   mistaken for regularisation error.
-2. `metrics.reg_jac_exactness(ex, J, varrho, rho)` — on `licq_two_eq` and
-   `mixed_kernel_quadratic` the regularised KKT Jacobian is available in closed
-   form. Any discrepancy there is a bug, full stop. Note that your P2 carries a
-   slack `z` and a *theta-dependent* proximal centre `g_theta(xbar)`; the closed
-   forms here assume the plain `K + diag(varrho I, -rho I)` system, so a
-   mismatch localised to `d_theta g` is the first thing to check.
+## Solutions and branch labels
+
+Every ground-truth branch is an `NLPSolution` with `kkt_residuals` filled in by
+`funcs.kkt`. The second-order character lives in `properties['kind']`
+(`'min'`, `'saddle'`, `'max'`, `'degenerate'`, `'reference'`) — read it with
+`core.kind_of`, since `properties` is now `Dict[str, Any]` and this is not a
+boolean. `Example.phi_bar` additionally carries the measured hypotheses.
 
 ## Examples
 
@@ -69,74 +92,66 @@ Two things worth doing before trusting any number:
 |---|---|---|---|
 | `fold` | 1 | SOSC, `beta != 0` | `x = +-sqrt(theta)`; **none** for `theta < 0` |
 | `cusp` | 1 | SOSC, `beta = 0` | unique `theta^(1/3)`; persists, Hölder-1/3 |
-| `pitchfork` | 1 | SOSC, `alpha = 0` | `0` for `theta <= 0`, `+-sqrt(theta)` after; non-unique |
-| `swallowtail` | 1 | A3 germ, `p = 2` | up to 3 roots; discriminant `4 t1^3 = 27 t2^2` |
+| `pitchfork` | 1 | SOSC, `alpha = 0` | `0` then `+-sqrt(theta)`; non-unique |
+| `swallowtail` | 1 | A3 germ, `n_theta = 2` | up to 3 roots; discriminant `4 t1^3 = 27 t2^2` |
 | `mixed_kernel_fold` | 2 | mixed kernel + fold | `x2 = +-sqrt(-2 b theta / c)`, one side only |
 | `mixed_kernel_quadratic` | 2 | mixed kernel, ratio trap | **unbounded** for `theta != 0`; line of KKT points at 0 |
 | `licq_two_eq` | 2 | pure LICQ | compatible dir: analytic; incompatible dir: **infeasible** |
 | `tangency` | 2 | LICQ + SOSC, `d = 2` | `const` on one side, Hölder-1/2 on the other |
 | `wachter_biegler` | 2 | none (control) | smooth; isolates bias from degeneracy |
 
-Every example declares its Hölder exponent per side, and
-`report.validate_examples()` checks the library against its own claims with no
-differentiator involved. All 15 example/direction pairs currently measure what
-they declare.
+Both claims are checked against measurement, with no differentiator involved:
+`report.validate_examples()` compares declared Hölder exponents to observed ones
+(15/15 agree), and `report.property_table()` reads LICQ / SOSC / strict
+complementarity / `dim ker K` off `funcs.ift`:
 
-The base point matters and is part of the example: `tangency` has a whole
-segment of valid multipliers at `theta = 0`, and `tangency(multiplier=s)` lets
-you pick. `lam1 = kappa/2` is the limit of the nondegenerate branch and is the
-choice that makes `ker K` two-dimensional.
+```
+example                           LICQ   strict comp          SOSC     K nonsing  dim ker K
+fold                               yes           yes            NO            NO          1
+licq_two_eq                         NO           yes           yes            NO          1
+tangency                            NO           yes            NO            NO          2
+wachter_biegler                    yes           yes           yes           yes          0
+```
+
+`tangency` is the one to watch: at `theta = 0` the multiplier set is a segment,
+and `tangency(multiplier=s)` picks a point in it. Only `lam1 = kappa/2` — the
+limit of the `theta < 0` branch — sees the full two-dimensional kernel; the
+other choices see dimension 1. The base multiplier is part of the problem
+specification, not a detail.
 
 ## Metrics
 
-All take a Jacobian:
-
-* `taylor` — the workhorse. Predicted vs true step over a log grid of `t`, both
-  sides, reporting absolute error, distance to the solution **set** (the right
-  metric when minimisers are non-unique), relative error, the fitted order of
-  the error in `t`, and `t_valid` = largest `t` where the prediction is still
-  within tolerance. Verdicts distinguish *second order*, *first order (biased)*,
-  *sublinear: true map not differentiable*, *no solution to predict*, and
-  *constant solution, derivative reports spurious motion*.
-* `hoelder` — properties of the true map only; validates the examples.
-* `asymmetry` — forward vs backward difference quotients vs the reported
-  directional derivative. Separates folds (one side missing) from kinks (both
-  finite, different).
-* `step_residual` — KKT residual of `phi_bar + t J d`, against the frozen point.
-  Meaningful even where no nearby solution exists: does the predicted step make
-  a better warm start?
-* `loss_gradient` — cosine similarity and relative error of `J^T grad loss`
-  against a finite difference of `loss(phi*(theta))`. The downstream criterion.
-* `eps_sweep` — `taylor` across regularisation weights; fits `|J d| ~ eps^-1`
-  and `t_valid ~ eps^2`.
-* `solution_bias` — the `O(eps)` row of the theory table. Deliberately separate
-  because it needs a *solution*, not a Jacobian.
-* `reg_jac_exactness` — closed-form comparison where available.
+All take a Jacobian: `taylor` (predicted vs true step, both sides, with fitted
+error order, distance-to-solution-set, and `t_valid`), `hoelder` (true map only),
+`asymmetry` (folds vs kinks), `step_residual` (warm-start value),
+`loss_gradient` (cosine + relative error downstream), `eps_sweep`
+(`|J d| ~ eps^-1`, `t_valid ~ eps^2`), `reg_jac_exactness`. `solution_bias` is
+separate because the `O(eps)` row of the theory table needs a *solution*, not a
+Jacobian.
 
 ## What the baseline already shows
 
-Running `demo.py` with the reference regularised-KKT differentiator:
+`demo.py` with the reference regularised-KKT differentiator:
 
 * **`fold`**: `|J| ~ eps^-1.00`, `t_valid ~ eps^2.00`, solution bias `~ eps^0.95`
-  — the three predicted rates, to two digits.
-* **ratio trap** (`mixed_kernel_quadratic`, `b = 1`): `cond(K+R)` rises from
-  4e4 to 4e8 as `varrho/rho` crosses `b^2 = 1`, with both weights strictly
-  positive throughout.
-* **`tangency`**: the reported `dx2/dtheta` is `1/||v||^2 = 1/5`, while the truth
-  is `0` on one side and `1` on the other — and that factor is **independent of
+  — the three predicted rates to two digits.
+* **ratio trap** (`mixed_kernel_quadratic`, `b = 1`): `cond(K+R)` rises 4e4 → 4e8
+  as `varrho/rho` crosses `b^2 = 1`, both weights strictly positive throughout.
+* **`tangency`**: reported `dx2/dtheta` is `1/||v||^2 = 1/5` while the truth is
+  `0` on one side and `1` on the other — and that factor is **independent of
   rho**. With parallel active constraints the dual regularisation splits the
   perturbation between primal motion and constraint violation, and the resulting
   primal error does not vanish as `rho -> 0`. Worth a figure.
-* **`fold` downstream**: cosine 1.0 with 68% relative error. The gradient is
-  useless as a magnitude and fine as a direction.
-* **`step_residual`** on `fold`: the predicted step *increases* the residual by
-  ~1000x at `t = 1e-1` and reduces it by 1e-7 at `t = 1e-4 ~ eps^2`. The `eps^2`
-  window is visible without any reference to the analytic solution.
+* **`fold` downstream**: cosine 1.0 with 68% relative error — useless as a
+  magnitude, fine as a direction.
+* **`step_residual`**: the predicted step *increases* the KKT residual ~1000x at
+  `t = 1e-1` and drives it to zero at `t = 1e-4 ~ eps^2`. The window is visible
+  without reference to the analytic solution.
 
 ## Next
 
-Tier 3 (strict-complementarity failure, active-set switching, MPCC) needs one
-addition to `core`: examples whose active set changes with `theta`, and a metric
-for the `O(rho)` displacement of the switching surface implied by eliminating
-`z` from P2. The `Branch.kind` field and `distance_to_set` are already in place
-for it.
+Tier 3 (strict-complementarity failure, active-set switching, MPCC) needs
+examples whose active set changes with `theta`, plus a metric for the `O(rho)`
+displacement of the switching surface implied by eliminating `z` from P2.
+`properties['kind']`, `adapter.active_set` and `distance_to_set` are already in
+place for it.

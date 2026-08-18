@@ -1,6 +1,9 @@
 """
-Suite-level driving and reporting.  ``run_suite`` is the one-call entry point:
-give it a differentiator callable and it walks every example / direction.
+Suite-level driving and reporting.
+
+``run_suite`` is the one-call entry point: hand it a differentiator with the
+``(nlp, solution) -> jacobian`` signature and it walks every example and every
+probe direction.
 """
 
 from __future__ import annotations
@@ -13,6 +16,22 @@ import numpy as np
 from . import examples as ex_mod
 from . import metrics as M
 from .core import Example, coerce_jac
+from .reference import FiniteDifferenceOracle
+from .types import ArrayLike, NLPSolution
+
+Differentiate = Callable[[object, NLPSolution], ArrayLike]
+
+
+def jacobian_for(differentiator: Differentiate, example: Example) -> ArrayLike:
+    """Call a differentiator on an example's NLP and reference solution.
+
+    Differentiators that need the example itself (the finite-difference oracle)
+    are bound first; everything else sees only ``(nlp, NLPSolution)``.
+    """
+    diff = differentiator
+    if isinstance(diff, FiniteDifferenceOracle):
+        diff = diff.bind(example)
+    return diff(example.nlp, example.phi_bar)
 
 
 @dataclass
@@ -34,6 +53,7 @@ class Suite:
     differentiator: str
     rows: List[Row] = field(default_factory=list)
     self_check: Dict[str, float] = field(default_factory=dict)
+    properties: Dict[str, Dict[str, object]] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
 
     def __str__(self) -> str:  # pragma: no cover
@@ -66,7 +86,7 @@ class Suite:
 
 
 def run_suite(
-    differentiator: Callable[[Example], object],
+    differentiator: Differentiate,
     names: Optional[Sequence[str]] = None,
     block: str = "x",
     ts: Sequence[float] = M.DEFAULT_TS,
@@ -74,19 +94,16 @@ def run_suite(
     tags: Optional[Sequence[str]] = None,
 ) -> Suite:
     """Walk examples x directions, calling ``differentiator`` once per example."""
-    pool = (
-        [ex_mod.get(n) for n in names]
-        if names
-        else ex_mod.all_examples(tags=tags)
-    )
+    pool = [ex_mod.get(n) for n in names] if names else ex_mod.all_examples(tags=tags)
     label = getattr(differentiator, "name", type(differentiator).__name__)
     suite = Suite(differentiator=label)
 
     for ex in pool:
         suite.self_check[ex.name] = ex.check_reference_point()
+        suite.properties[ex.name] = dict(ex.phi_bar.properties or {})
         try:
-            jac = differentiator(ex)
-            coerce_jac(jac, ex.layout, ex.p)
+            jac = jacobian_for(differentiator, ex)
+            coerce_jac(jac, ex.dims)
         except Exception as exc:  # a differentiator may legitimately refuse
             suite.notes.append(f"{ex.name}: differentiator raised {exc!r}")
             continue
@@ -97,12 +114,9 @@ def run_suite(
                 suite.rows.append(
                     Row(
                         example=ex.name, direction=dname, block=block, side=side,
-                        exists=rep.exists[side],
-                        true_order=rep.true_slope[side],
-                        err_order=rep.slope[side],
-                        t_valid=rep.t_valid[side],
-                        verdict=rep.verdict[side],
-                        expected=expected.get(side, "unset"),
+                        exists=rep.exists[side], true_order=rep.true_slope[side],
+                        err_order=rep.slope[side], t_valid=rep.t_valid[side],
+                        verdict=rep.verdict[side], expected=expected.get(side, "unset"),
                     )
                 )
     return suite
@@ -118,3 +132,18 @@ def validate_examples(
         for dname in ex.directions:
             out.append(M.hoelder(ex, direction=dname, block=block, ts=ts))
     return out
+
+
+def property_table(names: Optional[Sequence[str]] = None) -> str:
+    """Which hypotheses actually fail at each reference point, measured from
+    ``funcs.ift`` rather than asserted."""
+    pool = [ex_mod.get(n) for n in names] if names else ex_mod.all_examples()
+    keys = ("licq", "strict_complementarity", "sosc", "kkt_nonsingular")
+    labels = ("LICQ", "strict comp", "SOSC", "K nonsing")
+    hdr = f"{'example':<24}" + "".join(f"{l:>14}" for l in labels) + f"{'dim ker K':>11}"
+    lines = [hdr, "-" * len(hdr)]
+    for ex in pool:
+        props = ex.phi_bar.properties or {}
+        cells = "".join(f"{('yes' if props.get(k) else 'NO'):>14}" for k in keys)
+        lines.append(f"{ex.name:<24}{cells}{ex.kernel_numeric().shape[1]:>11}")
+    return "\n".join(lines)
