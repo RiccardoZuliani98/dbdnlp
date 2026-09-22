@@ -23,8 +23,10 @@ The script:
   1. builds the NLP symbolically (no ca.Opti -- DifferentiableNLP wants f, g, h),
   2. solves it and reports LICQ / SCS / SOSC / SSOSC at the solution,
   3. checks that P_2 anchored there reproduces it,
-  4. Taylor-tests  phi(m + dm) ~ phi(m) + dm * dphi/dm  against re-solves.
+  4. Taylor-tests  phi(m + dm) ~ phi(m) + dm * dphi/dm  against re-solves,
+  5. writes the trajectory data used by the position.tex figure.
 """
+import os
 import numpy as np
 import casadi as ca
 
@@ -327,3 +329,54 @@ if __name__ == "__main__":
               " ".join(f"{k.replace(' ', '_')}_vs_xcp {k.replace(' ', '_')}_vs_solver" for k in methods))
     np.savetxt(".results/dubins_taylor.dat", np.array(taylor), header=header, comments="")
     print("    (saved to dubins_taylor.dat for pgfplots)")
+
+    # ---------------- 7. data for the trajectory figure (position.tex) ----------------
+    # Three trajectories, each written as two-column pgfplots tables (t, value) for the
+    # x-position, y-position, throttle a and steering s:
+    #   suffix ""           : nominal solution x(m)
+    #   suffix "_m2"        : original NLP re-solved at m + dm, warm-started at x(m)
+    #   suffix "_m2_approx" : first-order prediction x(m) + dm * dx/dm (projected regularization)
+    # The time axis is physical time t_k = k * sigma / (N+1), with sigma the time scaling
+    # of that trajectory (for the prediction, sigma is itself predicted to first order,
+    # so its time axis stretches accordingly).
+    PLOT_DIR = ".results"          # copy the files to Figures/Data/ (the path used in position.tex)
+    PLOT_DM = 1e-1                 # parameter perturbation delta theta shown in the figure
+    PLOT_RHO = 1e-4                # regularization of the derivative used for the prediction
+    os.makedirs(PLOT_DIR, exist_ok=True)
+
+    def save_trajectory(z, suffix):
+        """Write x_pos, y_pos, a, s tables for primal vector z; return the final time."""
+        X, U = unpack(z, L)
+        t = np.arange(L["N"] + 1) * X[5, -1] / (L["N"] + 1)
+        # inputs are held constant on [t_k, t_{k+1}): repeat the last one at t_N so that
+        # every curve spans [0, t_N] (use `const plot` in pgfplots for exact steps)
+        series = {"x_pos": X[0], "y_pos": X[1],
+                  "a": np.r_[U[0], U[0, -1]], "s": np.r_[U[1], U[1, -1]]}
+        for name, v in series.items():
+            np.savetxt(os.path.join(PLOT_DIR, f"{name}{suffix}.tex"), np.column_stack([t, v]),
+                       header="t v", comments="", fmt="%.10e")
+        return t[-1], series
+
+    sol_p = nlp.solve(np.array([M0 + PLOT_DM]), x_warmstart=x0)
+    status_p = nlp.solver.stats()["return_status"]
+    x_p = np.array(sol_p.x).flatten()
+    x_app = x0 + PLOT_DM * dx_dm(nlp, M0, sol, "projected", rho_1=PLOT_RHO, rho_2=PLOT_RHO, tol=TOL)
+
+    tf, data = {}, {}
+    for label, z, suffix in [("nominal", x0, ""), ("perturbed", x_p, "_m2"),
+                             ("approx", x_app, "_m2_approx")]:
+        tf[label], data[label] = save_trajectory(z, suffix)
+
+    # final time for the x-axis limit (xmax=\dubinsTf in position.tex)
+    with open(os.path.join(PLOT_DIR, "position_params.tex"), "w") as fh:
+        fh.write(f"\\def\\dubinsTf{{{max(tf.values()):.6f}}}%\n")
+
+    print(f"\n--- 6. Figure data (dm = {PLOT_DM:g}, rho = {PLOT_RHO:g}), saved to {PLOT_DIR}/")
+    print(f"    re-solve at m + dm: status={status_p}")
+    print("    final time        " + "  ".join(f"{k}={v:.4f}" for k, v in tf.items()))
+    print(f"    |x(m+dm) - x(m)|              = {np.linalg.norm(x_p - x0):.3e}")
+    print(f"    |x(m+dm) - x(m) - dm * dx/dm| = {np.linalg.norm(x_p - x_app):.3e}")
+    print("    data ranges (for the y-axis limits):")
+    for name in ("x_pos", "y_pos", "a", "s"):
+        v = np.concatenate([d[name] for d in data.values()])
+        print(f"      {name:<6} [{v.min():+.3f}, {v.max():+.3f}]")
