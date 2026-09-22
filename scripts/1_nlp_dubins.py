@@ -165,19 +165,6 @@ def initial_guess(L, val=0.075):
     return np.full(L["nXtot"] + L["nU"] * L["N"], val)
 
 
-def component_name(i, L):
-    """
-    Human-readable label (e.g. "vx_3", "s_12") for entry i of the flat primal
-    vector x, used to annotate degeneracy/flat-direction diagnostics. Indices
-    below nXtot address a state component at some node; the rest address a
-    control component at some interval.
-    """
-    if i < L["nXtot"]:
-        return ["x", "y", "vx", "vy", "theta", "sigma"][i % L["nX"]] + f"_{i // L['nX']}"
-    j = i - L["nXtot"]
-    return ["a", "s"][j % L["nU"]] + f"_{j // L['nU']}"
-
-
 def closest_point_solver(nlp, eps=1e-8):
     """
     argmin f + eps/2 |x - x_bar|^2 s.t. g <= 0, h == 0: same feasible set and
@@ -237,13 +224,9 @@ if __name__ == "__main__":
           f"dim U={sub['dim_U']}, weakly active={len(sub['weak_idx'])}, "
           f"min eig of reduced Hessian={sub['min_reduced_eig']:.1e}")
     w, V = np.linalg.eigh(sub["Pi_P"])
-    flat_idx = []
     for c in np.where(w > 0.5)[0]:
         top = np.argsort(-np.abs(V[:, c]))[:2]
-        flat_idx.append(int(top[0]))
-        print("    flat direction along " + ", ".join(f"{component_name(i, L)} ({V[i, c]:+.2f})" for i in top))
-    flat = np.zeros(nlp.n_x, bool)
-    flat[flat_idx] = True
+        print("    flat direction along index " + ", ".join(f"{i} ({V[i, c]:+.2f})" for i in top))
     try:
         dx_dm(nlp, M0, sol, "active_set", tol=TOL, active_rule="ratio")
         print("    unregularized KKT system: solved")
@@ -257,31 +240,30 @@ if __name__ == "__main__":
     # (degenerate) NLP re-solved from a warm start, for comparison.
     prox = closest_point_solver(nlp)
     xcp = lambda m: np.array(prox.solve(np.r_[m, x0], x_warmstart=x0).x).flatten()
-    ref = (xcp(M0 + DELTA) - xcp(M0 - DELTA)) / (2 * DELTA)
-    warm = (np.array(nlp.solve([M0 + DELTA], x_warmstart=x0).x).flatten()
-            - np.array(nlp.solve([M0 - DELTA], x_warmstart=x0).x).flatten()) / (2 * DELTA)
+    ref_plus = xcp(M0 + DELTA)
+    ref_minus = xcp(M0 - DELTA)
+    ref = (ref_plus - ref_minus) / (2 * DELTA)
+    warm = (np.array(nlp.solve([M0 + DELTA], x_warmstart=ref_plus).x).flatten()
+            - np.array(nlp.solve([M0 - DELTA], x_warmstart=ref_minus).x).flatten()) / (2 * DELTA)
 
     # ---------------- 4. comparison ----------------
-    # Compare every differentiation mode/setting against `ref`: overall relative
-    # error, relative error restricted to the non-flat components, and the raw
-    # value on each flat direction (where different methods are expected to
-    # disagree, since the true derivative there is only defined up to the
-    # regularization/least-squares choice).
+    # Compare every differentiation mode/setting against both references, using
+    # the relative error over the full vector: `ref` (closest-point, well-posed
+    # even on the degenerate directions) and `warm` (plain warm-started FD on
+    # the original problem, itself just one method among the ones being judged).
     print("\n--- 3. dx/dm against the closest-point reference")
-    print(f"    {'method':<26} {'err (all)':>10} {'err (non-flat)':>15} "
-          + " ".join(f"{'d' + component_name(i, L):>9}" for i in flat_idx))
+    print(f"    {'method':<26} {'err vs ref':>10} {'err vs warm':>12}")
 
     def row(label, v):
-        """Print one comparison row: relative errors of sensitivity vector v against ref."""
-        print(f"    {label:<26} {rel(v, ref):>10.1e} {rel(v[~flat], ref[~flat]):>15.1e} "
-              + " ".join(f"{v[i]:>9.4f}" for i in flat_idx))
+        """Print one comparison row: relative error of v against ref and against warm, over the full vector."""
+        print(f"    {label:<26} {rel(v, ref):>10.1e} {rel(v, warm):>12.1e}")
 
     row("closest point (reference)", ref)
     row("warm-started IPOPT (FD)", warm)
     for r in RHOS:
         row(f"projected rho={r:.0e}", dx_dm(nlp, M0, sol, "projected", rho_1=r, rho_2=r, tol=TOL))
     row("least squares", dx_dm(nlp, M0, sol, "active_set", tol=TOL, lstsq=True, active_rule="ratio"))
-    for r in [1e-6, 1e-5, 1e-4]:
+    for r in RHOS:
         row(f"previous (rho I) rho={r:.0e}", dx_dm(nlp, M0, sol, "regularized", rho_1=r, rho_2=r))
 
     # ---------------- 5. invariance to constraint scaling ----------------
@@ -290,37 +272,43 @@ if __name__ == "__main__":
     # that the projected-regularization derivative of s_0 (the flat, standstill
     # steering direction) stays ~constant across c, while the plain
     # least-squares derivative does not.
-    i_s0 = flat_idx[[component_name(i, L) for i in flat_idx].index("s_0")] if any(
-        component_name(i, L) == "s_0" for i in flat_idx) else L["nXtot"] + 1
+    # s_0 is control 1 ("s") at interval 0: since U is flattened column-major
+    # after the nXtot state entries, a_0 sits at nXtot and s_0 right after it.
+    i_s0 = L["nXtot"] + 1
     print("\n--- 4. Same problem, initial condition imposed as c * X[0:5,0] = 0")
-    print(f"    {'c':>6} {'projected ds_0/dm':>18} {'err':>8} {'LS ds_0/dm':>12} {'err':>8}")
+    print(f"    {'c':>6} {'projected ds_0/dm':>18} {'err ref':>8} {'err warm':>9} "
+          f"{'LS ds_0/dm':>12} {'err ref':>8} {'err warm':>9}")
     for c in [1e-2, 1e-1, 1.0, 1e1, 1e2]:
         nlp_c, _ = build_dubins_nlp(N=N, integrator="euler", ic_scale=c)
         sol_c = nlp_c.solve(np.array([M0]), x_warmstart=x0)
         vp = dx_dm(nlp_c, M0, sol_c, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL)
         vl = dx_dm(nlp_c, M0, sol_c, "active_set", tol=TOL, lstsq=True, active_rule="ratio")
-        print(f"    {c:>6.0e} {vp[i_s0]:>18.2e} {rel(vp, ref):>8.1e} {vl[i_s0]:>12.4f} {rel(vl, ref):>8.1e}")
+        print(f"    {c:>6.0e} {vp[i_s0]:>18.2e} {rel(vp, ref):>8.1e} {rel(vp, warm):>9.1e} "
+              f"{vl[i_s0]:>12.4f} {rel(vl, ref):>8.1e} {rel(vl, warm):>9.1e}")
 
-    # ---------------- 6. Taylor test ----------------
-    # For shrinking step sizes dm, check that x0 + dm * dx/dm approximates the
-    # true closest-point re-solve x_cp(m + dm) to first order: the prediction
-    # error should shrink faster than the nominal displacement |x_cp - x0| as
-    # dm -> 0, for a correctly computed derivative.
-    print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
-    methods = {
-        "projected": dx_dm(nlp, M0, sol, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL),
-        "LS (c=0.1)": dx_dm(*(lambda n: (n, M0, n.solve(np.array([M0]), x_warmstart=x0)))(
-            build_dubins_nlp(N=N, integrator="euler", ic_scale=0.1)[0]),
-            "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
-        "previous 1e-5": dx_dm(nlp, M0, sol, "regularized", rho_1=1e-5, rho_2=1e-5),
-    }
-    print(f"    {'dm':>8} {'|x(m+dm)-x0|':>13} " + " ".join(f"{k:>14}" for k in methods))
-    taylor = []
-    for dm in [1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4]:
-        xt = xcp(M0 + dm)
-        errs = [np.linalg.norm(x0 + dm * v - xt) for v in methods.values()]
-        taylor.append([dm, np.linalg.norm(xt - x0)] + errs)
-        print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} " + " ".join(f"{e:>14.3e}" for e in errs))
-    np.savetxt("dubins_taylor.dat", np.array(taylor),
-               header="dm nominal " + " ".join(k.replace(' ', '_') for k in methods), comments="")
-    print("    (saved to dubins_taylor.dat for pgfplots)")
+    # # ---------------- 6. Taylor test ----------------
+    # # For shrinking step sizes dm, check that x0 + dm * dx/dm approximates the
+    # # true closest-point re-solve x_cp(m + dm) to first order: the prediction
+    # # error should shrink faster than the nominal displacement |x_cp - x0| as
+    # # dm -> 0, for a correctly computed derivative.
+    # print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
+    # methods = {
+    #     "projected": dx_dm(nlp, M0, sol, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL),
+    #     "LS (c=0.1)": dx_dm(*(lambda n: (n, M0, n.solve(np.array([M0]), x_warmstart=x0)))(
+    #         build_dubins_nlp(N=N, integrator="euler", ic_scale=0.1)[0]),
+    #         "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
+    #     "previous 1e-5": dx_dm(nlp, M0, sol, "regularized", rho_1=1e-5, rho_2=1e-5),
+    #     # unregularized FD on the original (degenerate) problem itself, i.e. no
+    #     # closest-point proximal term at all -- computed above as `warm`.
+    #     "FD unregularized": warm,
+    # }
+    # print(f"    {'dm':>8} {'|x(m+dm)-x0|':>13} " + " ".join(f"{k:>14}" for k in methods))
+    # taylor = []
+    # for dm in [1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4]:
+    #     xt = xcp(M0 + dm)
+    #     errs = [np.linalg.norm(x0 + dm * v - xt) for v in methods.values()]
+    #     taylor.append([dm, np.linalg.norm(xt - x0)] + errs)
+    #     print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} " + " ".join(f"{e:>14.3e}" for e in errs))
+    # np.savetxt("dubins_taylor.dat", np.array(taylor),
+    #            header="dm nominal " + " ".join(k.replace(' ', '_') for k in methods), comments="")
+    # print("    (saved to dubins_taylor.dat for pgfplots)")
