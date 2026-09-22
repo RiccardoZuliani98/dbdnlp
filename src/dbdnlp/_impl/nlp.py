@@ -2,6 +2,7 @@ import casadi as ca
 import numpy as np
 from typing import Dict, Optional, cast, Any
 from scipy.linalg import solve, null_space
+from time import perf_counter
 
 from dbdnlp._impl.types import (
     NLPFunctions, NLPSolution, NLPSymbolic, Symbolic,
@@ -261,6 +262,18 @@ class DifferentiableNLP:
         )
 
     @staticmethod
+    def _active_set(g_np: np.ndarray, lam_np: np.ndarray, tol: float, rule: str) -> np.ndarray:
+        """Indices of active inequalities (g <= 0 convention), see `degenerate_subspaces`."""
+        if g_np.size == 0:
+            return np.array([], dtype=int)
+        mask = g_np >= -tol
+        if rule == "ratio":
+            mask |= lam_np > -g_np
+        elif rule != "threshold":
+            raise ValueError(f"Unknown active_rule '{rule}'. Choose 'threshold' or 'ratio'.")
+        return np.where(mask)[0]
+
+    @staticmethod
     def _col(v: Optional[ArrayLike], n: int) -> ca.DM:
         """Length-n column DM; None or an empty input gives the (n, 1) zero vector."""
         if v is None:
@@ -299,7 +312,12 @@ class DifferentiableNLP:
             Sensitivity computation mode:
             - "full": Differentiates the full KKT system directly (non-symmetric).
             - "active_set": Identifies active inequalities and solves a reduced, 
-                            symmetric KKT system.
+                            symmetric KKT system. options['lstsq']=True returns
+                            the minimum-norm least-squares solution instead.
+            - "regularized": Previous regularization (rho_1 * I, rho_2 * I).
+            - "projected": Current regularization (rho_1 * Pi_P, rho_2 * Pi_U),
+                           see `degenerate_subspaces`. Options: rho_1, rho_2,
+                           active_tol, rank_tol, flat_tol, weak_as_active.
         options : Optional[Dict[str, Any]], optional
             Dictionary of options (e.g., {'tol': 1e-5} for active set thresholding).
 
@@ -371,7 +389,7 @@ class DifferentiableNLP:
 
         elif mode == "active_set":
             # Identify active inequalities (g <= 0, so g >= -tol means active)
-            active_idx = np.where(g_np >= -tol)[0] if n_ineq > 0 else np.array([], dtype=int)
+            active_idx = self._active_set(g_np, lam_np, tol, opts.get("active_rule", "threshold"))
             n_act = len(active_idx)
 
             # Assemble reduced symmetric KKT system
@@ -396,9 +414,14 @@ class DifferentiableNLP:
                 M[n_x + n_act:, :n_x] = J_hx_np
                 N_rhs[n_x + n_act:, :] = J_htheta_np
 
-            # Solve symmetric linear system
+            # Solve symmetric linear system. With options['lstsq']=True the
+            # minimum-norm least-squares solution is returned instead, which is
+            # the naive baseline when the KKT matrix is singular.
             #TODO: will this be fast, or should I convert M to a sparse scipy type?
-            d_act = solve(M, -N_rhs, assume_a='sym')
+            if opts.get("lstsq", False):
+                d_act = np.linalg.lstsq(M, -N_rhs, rcond=opts.get("rcond", None))[0]
+            else:
+                d_act = solve(M, -N_rhs, assume_a='sym')
 
             dx = d_act[:n_x, :]
             dlam = np.zeros((n_ineq, n_theta))
@@ -459,8 +482,55 @@ class DifferentiableNLP:
             dlam = d_full[n_x:n_x + n_ineq, :] if n_ineq > 0 else np.zeros((0, n_theta))
             dnu = d_full[n_x + n_ineq:, :] if n_eq > 0 else np.zeros((0, n_theta))
 
+        elif mode == "projected":
+            # Projected regularization (Prop. 4.1):
+            #   [ H + rho_1 Pi_P      J_sys^T       ] [dx  ]     [H_xtheta    ]
+            #   [ J_sys          -rho_2 Pi_U        ] [dpsi] = - [J_sys,theta ]
+            # J_sys stacks the active inequalities and the equalities. Pi_P and
+            # Pi_U vanish when the problem is nondegenerate, in which case this
+            # is exactly the "active_set" system, independently of rho.
+            rho_1 = opts.get("rho_1")
+            rho_2 = opts.get("rho_2")
+            if rho_1 is None or rho_2 is None:
+                raise ValueError("Options 'rho_1' and 'rho_2' must be provided for 'projected' mode.")
+
+            sub = self.degenerate_subspaces(
+                theta, x, lam, nu,
+                active_tol=opts.get("active_tol", tol),
+                rank_tol=opts.get("rank_tol", None),
+                flat_tol=opts.get("flat_tol", 1e-9),
+                weak_as_active=opts.get("weak_as_active", True),
+                active_rule=opts.get("active_rule", "ratio"),
+            )
+
+            # print(sub["timing"])
+
+            sys_idx = sub["sys_idx"]
+            n_sys = len(sys_idx)
+
+            J_sys = np.vstack([J_gx_np[sys_idx, :], J_hx_np])
+            J_sys_theta = np.vstack([J_gtheta_np[sys_idx, :], J_htheta_np])
+            n_m = J_sys.shape[0]
+
+            M = np.zeros((n_x + n_m, n_x + n_m))
+            M[:n_x, :n_x] = H_xx_np + rho_1 * sub["Pi_P"]
+            M[:n_x, n_x:] = J_sys.T
+            M[n_x:, :n_x] = J_sys
+            M[n_x:, n_x:] = -rho_2 * sub["Pi_U"]
+            N_rhs = np.vstack([H_xtheta_np, J_sys_theta])
+
+            d_p = solve(M, -N_rhs, assume_a='sym')
+
+            dx = d_p[:n_x, :]
+            dlam = np.zeros((n_ineq, n_theta))
+            if n_sys > 0:
+                dlam[sys_idx, :] = d_p[n_x:n_x + n_sys, :]
+            dnu = d_p[n_x + n_sys:, :] if n_eq > 0 else np.zeros((0, n_theta))
+
         else:
-            raise ValueError(f"Unknown mode '{mode}'. Choose 'full', 'active_set', or 'regularized'.")
+            raise ValueError(
+                f"Unknown mode '{mode}'. Choose 'full', 'active_set', 'regularized', or 'projected'."
+            )
 
         return {
             "x": ca.DM(dx),
@@ -585,6 +655,131 @@ class DifferentiableNLP:
             "n_active": int(active.size),
             "n_weakly_active": int(weak.size),
             "kkt_residual": kkt_res,
+        }
+
+    def degenerate_subspaces(
+        self,
+        theta: ArrayLike,
+        x: ArrayLike,
+        lam: ArrayLike,
+        nu: ArrayLike,
+        active_tol: float = 1e-6,
+        rank_tol: Optional[float] = None,
+        flat_tol: float = 1e-9,
+        weak_as_active: bool = True,
+        active_rule: str = "ratio",
+    ) -> Dict[str, Any]:
+        """
+        Computes the orthogonal projectors onto the degenerate subspaces U and P
+        of Section 3 at the primal-dual point (x, lam, nu).
+
+        U is the left null space of J_sys = [J_g[sys_idx]; J_h], expressed in the
+        coordinates of the multipliers (psi_in[sys_idx], psi_eq). It is trivial
+        iff LICQ holds on the constraints entering the linear system.
+
+        P is spanned by the directions of null(J_sys) along which the Hessian of
+        the Lagrangian is flat, i.e. the eigenvectors of Z^T H Z (Z an orthonormal
+        basis of null(J_sys)) with eigenvalue below flat_tol * scale.
+
+        Active set: with active_rule="threshold" an inequality is active iff
+        g >= -active_tol. With "ratio" (default) it is also active if lam > -g,
+        which is the natural test for interior-point output, where a constraint
+        with a small multiplier sits at distance ~ mu / lam from its bound.
+
+        Weakly active inequalities: with weak_as_active=True they enter J_sys
+        (they are assumed to remain active, giving one of the one-sided
+        derivatives). With False they are dropped and P is computed on K_+, as in
+        Corollary 3.2. Under SCS both choices coincide.
+
+        Returns
+        -------
+        Dict with keys: Pi_P (n_x, n_x), Pi_U (n_m, n_m), dim_P, dim_U,
+        sys_idx, active_idx, strong_idx, weak_idx, min_reduced_eig (negative
+        values of significant size indicate that Assumption 3.1 fails),
+        smallest_nonflat_eig (gap to the flat eigenvalues, useful to sanity
+        check flat_tol).
+        """
+
+        start_time = perf_counter()
+
+        H_dm, _, Jg_dm, _, Jh_dm, _ = self.funcs.ift(x, lam, nu, theta)
+        H = np.array(ca.DM(H_dm).full()).reshape(self.n_x, self.n_x)
+        H = 0.5 * (H + H.T)
+        J_g = np.array(ca.DM(Jg_dm).full()).reshape(self.n_ineq, self.n_x)
+        J_h = np.array(ca.DM(Jh_dm).full()).reshape(self.n_eq, self.n_x)
+
+        g_np = np.array(ca.DM(self.funcs.ineq(x, theta)).full()).flatten()
+        lam_np = np.array(ca.DM(lam).full()).flatten()
+
+        convert_time_end = perf_counter()
+
+        active = self._active_set(g_np, lam_np, active_tol, active_rule)
+        strong = active[lam_np[active] > active_tol] if active.size else active
+        weak = np.setdiff1d(active, strong)
+        sys_idx = active if weak_as_active else strong
+
+        J_sys = np.vstack([J_g[sys_idx, :], J_h])
+        n_m = J_sys.shape[0]
+
+        active_set_time_end = perf_counter()
+
+        # --- U: left null space of J_sys --------------------------------------
+        if n_m > 0:
+            N_U = null_space(J_sys.T, rcond=rank_tol) if rank_tol else null_space(J_sys.T)
+        else:
+            N_U = np.zeros((0, 0))
+        Pi_U = N_U @ N_U.T if N_U.size else np.zeros((n_m, n_m))
+
+        j_sys_null_time_end = perf_counter()
+
+        # --- P: flat directions of H on null(J_sys) ---------------------------
+        if n_m > 0:
+            Z = null_space(J_sys, rcond=rank_tol) if rank_tol else null_space(J_sys)
+        else:
+            Z = np.eye(self.n_x)
+
+        flat_directions_end = perf_counter()
+
+        min_eig, gap = np.inf, np.inf
+        Pi_P = np.zeros((self.n_x, self.n_x))
+        dim_P = 0
+        if Z.shape[1] > 0:
+            H_red = Z.T @ H @ Z
+            H_red = 0.5 * (H_red + H_red.T)
+            w, W = np.linalg.eigh(H_red)
+            scale = max(1.0, float(np.max(np.abs(w))))
+            flat = np.abs(w) <= flat_tol * scale
+            min_eig = float(w[0])
+            if np.any(~flat):
+                gap = float(np.min(np.abs(w[~flat])))
+            if np.any(flat):
+                B_P = Z @ W[:, flat]
+                Pi_P = B_P @ B_P.T
+                dim_P = int(flat.sum())
+
+        assemble_end = perf_counter()
+
+        tot_time = {
+            "convert":      convert_time_end - start_time,
+            "active_set":   active_set_time_end - convert_time_end,
+            "j_sys_null":   j_sys_null_time_end - active_set_time_end,
+            "flat_dir":     flat_directions_end - j_sys_null_time_end,
+            "assemble":     assemble_end - flat_directions_end,
+            "total":        assemble_end - start_time
+        }
+
+        return {
+            "Pi_P": Pi_P,
+            "Pi_U": Pi_U,
+            "dim_P": dim_P,
+            "dim_U": int(N_U.shape[1]) if N_U.size else 0,
+            "sys_idx": sys_idx,
+            "active_idx": active,
+            "strong_idx": strong,
+            "weak_idx": weak,
+            "min_reduced_eig": min_eig,
+            "smallest_nonflat_eig": gap,
+            "timing": tot_time
         }
 
     def annotate_solution(self, sol: "NLPSolution", **kwargs) -> Dict[str, Any]:
