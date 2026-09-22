@@ -325,5 +325,5 @@ if __name__ == "__main__":
               + " ".join(f"{e:>16.3e}" for e in errs))
     header = ("dm nominal resolve_err " +
               " ".join(f"{k.replace(' ', '_')}_vs_xcp {k.replace(' ', '_')}_vs_solver" for k in methods))
-    np.savetxt("dubins_taylor.dat", np.array(taylor), header=header, comments="")
+    np.savetxt(".results/dubins_taylor.dat", np.array(taylor), header=header, comments="")
     print("    (saved to dubins_taylor.dat for pgfplots)")
