@@ -286,29 +286,29 @@ if __name__ == "__main__":
         print(f"    {c:>6.0e} {vp[i_s0]:>18.2e} {rel(vp, ref):>8.1e} {rel(vp, warm):>9.1e} "
               f"{vl[i_s0]:>12.4f} {rel(vl, ref):>8.1e} {rel(vl, warm):>9.1e}")
 
-    # # ---------------- 6. Taylor test ----------------
-    # # For shrinking step sizes dm, check that x0 + dm * dx/dm approximates the
-    # # true closest-point re-solve x_cp(m + dm) to first order: the prediction
-    # # error should shrink faster than the nominal displacement |x_cp - x0| as
-    # # dm -> 0, for a correctly computed derivative.
-    # print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
-    # methods = {
-    #     "projected": dx_dm(nlp, M0, sol, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL),
-    #     "LS (c=0.1)": dx_dm(*(lambda n: (n, M0, n.solve(np.array([M0]), x_warmstart=x0)))(
-    #         build_dubins_nlp(N=N, integrator="euler", ic_scale=0.1)[0]),
-    #         "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
-    #     "previous 1e-5": dx_dm(nlp, M0, sol, "regularized", rho_1=1e-5, rho_2=1e-5),
-    #     # unregularized FD on the original (degenerate) problem itself, i.e. no
-    #     # closest-point proximal term at all -- computed above as `warm`.
-    #     "FD unregularized": warm,
-    # }
-    # print(f"    {'dm':>8} {'|x(m+dm)-x0|':>13} " + " ".join(f"{k:>14}" for k in methods))
-    # taylor = []
-    # for dm in [1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4]:
-    #     xt = xcp(M0 + dm)
-    #     errs = [np.linalg.norm(x0 + dm * v - xt) for v in methods.values()]
-    #     taylor.append([dm, np.linalg.norm(xt - x0)] + errs)
-    #     print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} " + " ".join(f"{e:>14.3e}" for e in errs))
-    # np.savetxt("dubins_taylor.dat", np.array(taylor),
-    #            header="dm nominal " + " ".join(k.replace(' ', '_') for k in methods), comments="")
-    # print("    (saved to dubins_taylor.dat for pgfplots)")
+    # ---------------- 6. Taylor test ----------------
+    # For shrinking step sizes dm, check that x0 + dm * dx/dm approximates the
+    # true closest-point re-solve x_cp(m + dm) to first order: the prediction
+    # error should shrink faster than the nominal displacement |x_cp - x0| as
+    # dm -> 0, for a correctly computed derivative.
+    print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
+    methods = {
+        "projected": dx_dm(nlp, M0, sol, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL),
+        "LS (c=0.1)": dx_dm(*(lambda n: (n, M0, n.solve(np.array([M0]), x_warmstart=x0)))(
+            build_dubins_nlp(N=N, integrator="euler", ic_scale=0.1)[0]),
+            "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
+        "previous 1e-5": dx_dm(nlp, M0, sol, "regularized", rho_1=1e-5, rho_2=1e-5),
+        # unregularized FD on the original (degenerate) problem itself, i.e. no
+        # closest-point proximal term at all -- computed above as `warm`.
+        "FD unregularized": warm,
+    }
+    print(f"    {'dm':>8} {'|x(m+dm)-x0|':>13} " + " ".join(f"{k:>14}" for k in methods))
+    taylor = []
+    for dm in [1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4]:
+        xt = xcp(M0 + dm)
+        errs = [np.linalg.norm(x0 + dm * v - xt) for v in methods.values()]
+        taylor.append([dm, np.linalg.norm(xt - x0)] + errs)
+        print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} " + " ".join(f"{e:>14.3e}" for e in errs))
+    np.savetxt("dubins_taylor.dat", np.array(taylor),
+               header="dm nominal " + " ".join(k.replace(' ', '_') for k in methods), comments="")
+    print("    (saved to dubins_taylor.dat for pgfplots)")
