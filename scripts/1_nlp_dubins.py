@@ -302,13 +302,28 @@ if __name__ == "__main__":
         # closest-point proximal term at all -- computed above as `warm`.
         "FD unregularized": warm,
     }
-    print(f"    {'dm':>8} {'|x(m+dm)-x0|':>13} " + " ".join(f"{k:>14}" for k in methods))
+    # Each method's linear prediction x0 + dm*v is checked against two targets:
+    # xt, the closest-point re-solve (well-posed reference), and x_resolve, the
+    # ORIGINAL (degenerate) solver re-solved at m+dm and warm-started at xt --
+    # if the original solver reliably landed back on xt, both errors would
+    # coincide; instead it typically drifts to a different point of the flat
+    # solution set, so the two columns per method can disagree.
+    print(f"    {'dm':>8} {'|x(m+dm)-x0|':>13} {'|resolve-xt|':>13} "
+          + " ".join(f"{k + ' vs xcp':>16} {k + ' vs solver':>16}" for k in methods))
     taylor = []
     for dm in [1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4]:
         xt = xcp(M0 + dm)
-        errs = [np.linalg.norm(x0 + dm * v - xt) for v in methods.values()]
-        taylor.append([dm, np.linalg.norm(xt - x0)] + errs)
-        print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} " + " ".join(f"{e:>14.3e}" for e in errs))
-    np.savetxt("dubins_taylor.dat", np.array(taylor),
-               header="dm nominal " + " ".join(k.replace(' ', '_') for k in methods), comments="")
+        x_resolve = np.array(nlp.solve([M0 + dm], x_warmstart=xt).x).flatten()
+        resolve_err = np.linalg.norm(x_resolve - xt)
+        errs = []
+        for v in methods.values():
+            pred = x0 + dm * v
+            errs.append(np.linalg.norm(pred - xt))
+            errs.append(np.linalg.norm(pred - x_resolve))
+        taylor.append([dm, np.linalg.norm(xt - x0), resolve_err] + errs)
+        print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} {resolve_err:>13.3e} "
+              + " ".join(f"{e:>16.3e}" for e in errs))
+    header = ("dm nominal resolve_err " +
+              " ".join(f"{k.replace(' ', '_')}_vs_xcp {k.replace(' ', '_')}_vs_solver" for k in methods))
+    np.savetxt("dubins_taylor.dat", np.array(taylor), header=header, comments="")
     print("    (saved to dubins_taylor.dat for pgfplots)")
