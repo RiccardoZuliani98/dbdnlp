@@ -318,48 +318,86 @@ def unpack(z: ca.DM, L:dict[str, int]) -> Tuple[ca.DM, ca.DM]:
     u = z[L["nx_tot"]:].reshape((L["nu"], L["N"]))
     return x, u
 
-def dx_dm(nlp, m, sol, mode, **opts) -> ca.DM:
+# =====================================================================
+# ERROR COMPUTATION
+# =====================================================================
+
+def compute_error(a:ca.DM | np.ndarray,b: ca.DM | np.ndarray) -> Tuple[float, float]:
     """
-    Compute the sensitivity ``dx/dm`` of the primal solution.
- 
-    Evaluates the derivative of the optimal primal vector with respect to
-    the scalar parameter `m` at a given primal-dual solution.
- 
+    Compare a vector or matrix against a reference.
+
+    Both inputs are flattened first, so for matrices the relative error is
+    the Frobenius-norm error and the cosine similarity uses the Frobenius
+    inner product.
+
+    Parameters
+    ----------
+    a : ca.DM or numpy.ndarray
+        Quantity to evaluate, e.g. a computed sensitivity ``dx/dtheta``.
+    b : ca.DM or numpy.ndarray
+        Reference with the same number of entries as `a`. Must be nonzero.
+
+    Returns
+    -------
+    cos_sim : float
+        Cosine similarity ``<a, b> / (|a| |b|)``, in ``[-1, 1]``.
+    relative_error : float
+        Relative error ``|a - b| / |b|``.
+    """
+    # flatten
+    a, b = np.ravel(a), np.ravel(b)
+
+    # relative error
+    relative_error = float(np.linalg.norm(a - b) / np.linalg.norm(b))
+    
+    # cosine similarity
+    cos_sim = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    return cos_sim, relative_error
+
+
+# =====================================================================
+# CLOSEST POINT SOLVER (PROXIMAL)
+# =====================================================================
+
+def closest_point_solver(nlp: DifferentiableNLP, eps=1e-8) -> DifferentiableNLP:
+    """
+    Build the closest-point (proximal) variant of an NLP.
+
+    The returned problem is ``min f(x) + eps/2 |x - x_bar|^2`` subject to the
+    constraints of `nlp`, with ``x_bar`` appended to the parameters. It has
+    the same feasible set and cost as `nlp`, but when the original solution
+    set is degenerate (flat directions), it picks the point closest to
+    ``x_bar``. This gives a well-posed finite-difference reference for
+    ``dx/dtheta``.
+
     Parameters
     ----------
     nlp : DifferentiableNLP
-        Problem with a scalar parameter, as built by `build_dubins_nlp`
-        with ``goal_as_param=False``.
-    m : float
-        Parameter value at which the solution was computed.
-    sol : object
-        Solution returned by ``nlp.solve``, with attributes ``x``
-        (primal), ``lam`` (inequality multipliers) and ``nu`` (equality
-        multipliers).
-    mode : str
-        Differentiation method, e.g. ``"active_set"``, ``"projected"`` or
-        ``"regularized"``. See `DifferentiableNLP.differentiate`.
-    **opts
-        Method-specific options forwarded to ``nlp.differentiate``, e.g.
-        ``rho_1``, ``rho_2``, ``tol``, ``lstsq``, ``active_rule``.
- 
+        Original problem. Its symbolic primal variable must be ``ca.MX``.
+    eps : float, default 1e-8
+        Weight of the proximal term. It should be small enough not to
+        noticeably change the solution along nondegenerate directions.
+
     Returns
     -------
-    ca.DM
-        Sensitivity ``dx/dm``, same length and ordering as the primal
-        vector.
- 
-    Raises
-    ------
-    numpy.linalg.LinAlgError
-        If the chosen method solves an unregularized KKT system and that
-        system is singular (e.g. ``mode="active_set"`` on the degenerate
-        Euler problem).
+    DifferentiableNLP
+        Proximal problem with parameter ``[theta; x_bar]``, of length
+        ``n_theta + n_x``. It is solved with the module-level `SOLVER_OPTS`.
     """
-    return nlp.differentiate(
-        ca.DM([m]), sol.x, sol.lam, sol.nu,
-        mode=mode, options=opts
-    )["x"]
+    # extract nlp symbols
+    sym = nlp.sym
+
+    # we need a nominal solution as parameter
+    xb = MX_sym("x_bar", nlp.n_x)
+
+    # form new differentiable NLP and return
+    return DifferentiableNLP(
+        x=sym.primal, theta=cast(ca.MX, ca.vertcat(sym.param, xb)),
+        f=sym.cost + eps / 2 * ca.sumsqr(sym.primal - xb),
+        g=sym.ineq, h=sym.eq, solver_opts=dict(SOLVER_OPTS)
+    )
+
 
 # =====================================================================
 # MAIN
@@ -397,9 +435,60 @@ if __name__ == "__main__":
 
     # see if nominal KKT system can be solved
     try:
-        dx_dm(nlp, M0, sol, "active_set", tol=TOL, active_rule="ratio")
+        nlp.differentiate(
+            ca.DM([M0]), sol.x, sol.lam, sol.nu,
+            mode="active_set",
+            options = {"tol":TOL, "active_rule":"ratio"}
+        )["x"]
         print("    unregularized KKT system: solved")
     except np.linalg.LinAlgError:
         print("    unregularized KKT system: singular")
 
-    
+    # ---------------- 3. references ----------------
+    # `ref`: central finite difference of the closest-point re-solve (well-posed
+    # even on the degenerate flat directions, since eps/2|x-x_bar|^2 picks a
+    # unique minimizer). `warm`: central finite difference of the original
+    # (degenerate) NLP re-solved from a warm start, for comparison.
+    prox = closest_point_solver(nlp)
+    xcp = lambda m: prox.solve(np.r_[m, x0], x_warmstart=x0).x
+    ref_plus = xcp(M0 + DELTA)
+    ref_minus = xcp(M0 - DELTA)
+    ref = (ref_plus - ref_minus) / (2 * DELTA)
+    warm = (
+        nlp.solve(ca.DM([M0 + DELTA]), x_warmstart=ref_plus).x 
+        - nlp.solve(ca.DM([M0 - DELTA]), x_warmstart=ref_minus).x
+    ) / (2 * DELTA)
+
+    # ---------------- 4. comparison ----------------
+    # Compare every differentiation mode/setting against both references, using
+    # the relative error over the full vector: `ref` (closest-point, well-posed
+    # even on the degenerate directions) and `warm` (plain warm-started FD on
+    # the original problem, itself just one method among the ones being judged).
+    print("\n--- 3. dx/dm against the closest-point reference")
+    print(f"    {'method':<26} {'err vs ref':>10} {'err vs warm':>12}")
+
+    err_rows = []                  # (method, rho, err vs proximal FD, err vs warm-started FD)
+
+    def row(label, v, method, rho=np.nan):
+        """Print one comparison row (relative error of v against ref and warm) and store it."""
+        err_rows.append((method, rho, rel(v, ref), rel(v, warm)))
+        print(f"    {label:<26} {rel(v, ref):>10.1e} {rel(v, warm):>12.1e}")
+
+    row("closest point (reference)", ref, "proxFD")
+    row("warm-started IPOPT (FD)", warm, "warmFD")
+    for r in RHOS:
+        row(f"projected rho={r:.0e}", dx_dm(nlp, M0, sol, "projected", rho_1=r, rho_2=r, tol=TOL),
+            "projected", r)
+    row("least squares", dx_dm(nlp, M0, sol, "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
+        "lstsq")
+    for r in RHOS:
+        row(f"previous (rho I) rho={r:.0e}", dx_dm(nlp, M0, sol, "regularized", rho_1=r, rho_2=r),
+            "uniform", r)
+
+    # tab:dubins_errors. `nan` marks entries that are "--" in the table (no rho, or a
+    # reference compared against itself). Readable with \pgfplotstableread.
+    with open(os.path.join(RESULTS_DIR, "dubins_errors.dat"), "w") as fh:
+        fh.write("method rho err_prox err_warm\n")
+        for meth, r, ep, ew in err_rows:
+            fh.write(f"{meth} {r:.1e} {ep:.3e} {ew:.3e}\n")
+    print(f"    (saved to {RESULTS_DIR}/dubins_errors.dat)")
