@@ -24,11 +24,18 @@ The script:
   2. solves it and reports LICQ / SCS / SOSC / SSOSC at the solution,
   3. checks that P_2 anchored there reproduces it,
   4. Taylor-tests  phi(m + dm) ~ phi(m) + dm * dphi/dm  against re-solves,
-  5. writes the trajectory data used by the position.tex figure.
+  5. writes the trajectory data used by the position.tex figure,
+  6. writes the data for the remaining tables/figures of the paper (all in RESULTS_DIR):
+       dubins_errors.dat   -> tab:dubins_errors  (relative errors, all methods and rho)
+       dubins_scaling.dat  -> tab:scaling        (ds_0/dm and errors vs. constraint scaling c)
+       dubins_taylor.dat   -> fig:dubins_taylor  (first-order prediction error vs. dm)
+       dubins_theta3.dat   -> 3-parameter test   (relative error and cosine similarity)
+       dubins_times.dat    -> tab:comp_times     (computation times, mean/variance)
 """
 import os
 import numpy as np
 import casadi as ca
+from time import perf_counter
 
 from dbdnlp import DifferentiableNLP
 
@@ -73,7 +80,9 @@ def build_dubins_nlp(
     v_max=None,
     solver_opts=None,
     integrator="rk4",
-    ic_scale=1.0
+    ic_scale=1.0,
+    goal_as_param=False,
+    goal=(0.5, 0.25),
 ):
     """
     Returns (nlp, layout) where layout lets you unpack X and U from x.
@@ -82,11 +91,19 @@ def build_dubins_nlp(
     ic_scale   : the initial condition is imposed as ic_scale * X[0:5, 0] = 0. Any
                  ic_scale != 0 describes the same problem; it only rescales constraint
                  rows (and their multipliers).
+    goal_as_param : if True the parameter is theta = [m, p_x(T), p_y(T)] (3 components),
+                 i.e. the terminal position becomes a parameter as well; otherwise theta = m
+                 and the terminal position is fixed to `goal`.
     """
     nX, nU = 6, 2
     X = ca.MX.sym("X", nX, N + 1)   # state trajectory: columns are shooting nodes 0..N
     U = ca.MX.sym("U", nU, N)       # control trajectory: columns are intervals 0..N-1
-    m = ca.MX.sym("m", 1)           # scalar parameter that scales the steering bound
+    if goal_as_param:
+        theta = ca.MX.sym("theta", 3)   # [steering-bound scaling, p_x(T), p_y(T)]
+        m, goal = theta[0], theta[1:3]
+    else:
+        theta = ca.MX.sym("m", 1)       # scalar parameter that scales the steering bound
+        m, goal = theta, ca.DM(list(goal))
 
     # continuous dynamics: symbolic template fc(x, u, m) -> xdot, later plugged
     # into each shooting interval by rk4() or the explicit Euler step below.
@@ -104,7 +121,6 @@ def build_dubins_nlp(
     fc = ca.Function("fc", [xs, us, ms], [ca.vertcat(sg * rhs, 0)])
 
     dt = 1.0 / (N + 1)
-    goal = ca.DM([0.5, 0.25])
 
     # ---- equalities h(x, m) = 0 ----
     h = [ic_scale * X[0:5, 0]]                        # start at rest at origin
@@ -144,7 +160,7 @@ def build_dubins_nlp(
     # flatten (X, U) into a single primal vector, column-major (Fortran) order,
     # matching the reshape used by unpack() to invert this.
     x = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
-    nlp = DifferentiableNLP(x=x, theta=m, f=f, g=g, h=h,
+    nlp = DifferentiableNLP(x=x, theta=theta, f=f, g=g, h=h,
                             solver_opts=dict(solver_opts or SOLVER_OPTS))
     return nlp, dict(N=N, nX=nX, nU=nU, nXtot=nX * (N + 1), integrator=integrator)
 
@@ -183,6 +199,52 @@ def closest_point_solver(nlp, eps=1e-8):
                              g=S.ineq, h=S.eq, solver_opts=dict(SOLVER_OPTS))
 
 
+def dx_dtheta(nlp, theta, sol, mode, **opts):
+    """Full sensitivity dx/dtheta as a (n_x, n_theta) numpy array (see dx_dm)."""
+    d = nlp.differentiate(np.atleast_1d(np.asarray(theta, float)), sol.x, sol.lam, sol.nu,
+                          mode=mode, options=opts)
+    return np.array(ca.DM(d["x"]).full()).reshape(nlp.n_x, nlp.n_theta)
+
+
+def fd_jacobians(nlp, prox, theta0, x_bar, delta):
+    """
+    Central finite-difference Jacobians dx/dtheta, one parameter component at a time:
+      prox : FD of the closest-point (proximal) problem, warm-started at x_bar;
+      warm : FD of the original problem, warm-started at the proximal solutions x^+/x^-.
+    Both are (n_x, n_theta) arrays.
+    """
+    theta0 = np.atleast_1d(np.asarray(theta0, float))
+    J_prox = np.zeros((nlp.n_x, theta0.size))
+    J_warm = np.zeros((nlp.n_x, theta0.size))
+    for j in range(theta0.size):
+        e = np.zeros(theta0.size)
+        e[j] = delta
+        xp = np.array(prox.solve(np.r_[theta0 + e, x_bar], x_warmstart=x_bar).x).flatten()
+        xm = np.array(prox.solve(np.r_[theta0 - e, x_bar], x_warmstart=x_bar).x).flatten()
+        J_prox[:, j] = (xp - xm) / (2 * delta)
+        wp = np.array(nlp.solve(theta0 + e, x_warmstart=xp).x).flatten()
+        wm = np.array(nlp.solve(theta0 - e, x_warmstart=xm).x).flatten()
+        J_warm[:, j] = (wp - wm) / (2 * delta)
+    return J_prox, J_warm
+
+
+def cos_sim(a, b):
+    """Cosine similarity of a and b, flattened (Frobenius inner product for matrices)."""
+    a, b = np.ravel(a), np.ravel(b)
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def time_it(fn, reps):
+    """Wall-clock times (s) of `reps` calls of fn(), after one untimed warm-up call."""
+    fn()
+    t = np.empty(reps)
+    for i in range(reps):
+        t0 = perf_counter()
+        fn()
+        t[i] = perf_counter() - t0
+    return t
+
+
 def dx_dm(nlp, m, sol, mode, **opts):
     """
     Sensitivity of the primal solution w.r.t. the parameter m, dx/dm, evaluated
@@ -210,6 +272,12 @@ if __name__ == "__main__":
     DELTA = 1e-5
     TOL = 1e-7                     # active-set tolerance (complementarity-aware rule)
     RHOS = [1e-8, 1e-6, 1e-4, 1e-2, 1.0]
+    RHO = 1e-4                     # regularization used everywhere a single rho is needed
+    C_LIST = [1e-2, 1e-1, 1.0, 1e1, 1e2]
+    THETA3 = np.array([M0, 0.5, 0.25])   # nominal [m, p_x(T), p_y(T)] for the 3-parameter test
+    N_TIMING = 100                 # evaluations per method for tab:comp_times
+    RESULTS_DIR = ".results"       # all .dat/.tex outputs go here
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     nlp, L = build_dubins_nlp(N=N, integrator="euler")
     print(f"Dubins NLP (Euler): n_x={nlp.n_x}  n_ineq={nlp.n_ineq}  n_eq={nlp.n_eq}")
@@ -256,17 +324,31 @@ if __name__ == "__main__":
     print("\n--- 3. dx/dm against the closest-point reference")
     print(f"    {'method':<26} {'err vs ref':>10} {'err vs warm':>12}")
 
-    def row(label, v):
-        """Print one comparison row: relative error of v against ref and against warm, over the full vector."""
+    err_rows = []                  # (method, rho, err vs proximal FD, err vs warm-started FD)
+
+    def row(label, v, method, rho=np.nan):
+        """Print one comparison row (relative error of v against ref and warm) and store it."""
+        err_rows.append((method, rho, rel(v, ref), rel(v, warm)))
         print(f"    {label:<26} {rel(v, ref):>10.1e} {rel(v, warm):>12.1e}")
 
-    row("closest point (reference)", ref)
-    row("warm-started IPOPT (FD)", warm)
+    row("closest point (reference)", ref, "proxFD")
+    row("warm-started IPOPT (FD)", warm, "warmFD")
     for r in RHOS:
-        row(f"projected rho={r:.0e}", dx_dm(nlp, M0, sol, "projected", rho_1=r, rho_2=r, tol=TOL))
-    row("least squares", dx_dm(nlp, M0, sol, "active_set", tol=TOL, lstsq=True, active_rule="ratio"))
+        row(f"projected rho={r:.0e}", dx_dm(nlp, M0, sol, "projected", rho_1=r, rho_2=r, tol=TOL),
+            "projected", r)
+    row("least squares", dx_dm(nlp, M0, sol, "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
+        "lstsq")
     for r in RHOS:
-        row(f"previous (rho I) rho={r:.0e}", dx_dm(nlp, M0, sol, "regularized", rho_1=r, rho_2=r))
+        row(f"previous (rho I) rho={r:.0e}", dx_dm(nlp, M0, sol, "regularized", rho_1=r, rho_2=r),
+            "uniform", r)
+
+    # tab:dubins_errors. `nan` marks entries that are "--" in the table (no rho, or a
+    # reference compared against itself). Readable with \pgfplotstableread.
+    with open(os.path.join(RESULTS_DIR, "dubins_errors.dat"), "w") as fh:
+        fh.write("method rho err_prox err_warm\n")
+        for meth, r, ep, ew in err_rows:
+            fh.write(f"{meth} {r:.1e} {ep:.3e} {ew:.3e}\n")
+    print(f"    (saved to {RESULTS_DIR}/dubins_errors.dat)")
 
     # ---------------- 5. invariance to constraint scaling ----------------
     # Rebuild the NLP with the initial-condition constraint scaled by c (a
@@ -280,13 +362,21 @@ if __name__ == "__main__":
     print("\n--- 4. Same problem, initial condition imposed as c * X[0:5,0] = 0")
     print(f"    {'c':>6} {'projected ds_0/dm':>18} {'err ref':>8} {'err warm':>9} "
           f"{'LS ds_0/dm':>12} {'err ref':>8} {'err warm':>9}")
-    for c in [1e-2, 1e-1, 1.0, 1e1, 1e2]:
+    scaling = []
+    for c in C_LIST:
         nlp_c, _ = build_dubins_nlp(N=N, integrator="euler", ic_scale=c)
         sol_c = nlp_c.solve(np.array([M0]), x_warmstart=x0)
-        vp = dx_dm(nlp_c, M0, sol_c, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL)
+        vp = dx_dm(nlp_c, M0, sol_c, "projected", rho_1=RHO, rho_2=RHO, tol=TOL)
         vl = dx_dm(nlp_c, M0, sol_c, "active_set", tol=TOL, lstsq=True, active_rule="ratio")
+        scaling.append([c, vp[i_s0], rel(vp, ref), rel(vp, warm),
+                        vl[i_s0], rel(vl, ref), rel(vl, warm)])
         print(f"    {c:>6.0e} {vp[i_s0]:>18.2e} {rel(vp, ref):>8.1e} {rel(vp, warm):>9.1e} "
               f"{vl[i_s0]:>12.4f} {rel(vl, ref):>8.1e} {rel(vl, warm):>9.1e}")
+    # tab:scaling (the table uses the *_prox columns; *_warm are for reference)
+    np.savetxt(os.path.join(RESULTS_DIR, "dubins_scaling.dat"), np.array(scaling),
+               header="c proj_ds0 proj_err_prox proj_err_warm ls_ds0 ls_err_prox ls_err_warm",
+               comments="", fmt="%.6e")
+    print(f"    (saved to {RESULTS_DIR}/dubins_scaling.dat)")
 
     # ---------------- 6. Taylor test ----------------
     # For shrinking step sizes dm, check that x0 + dm * dx/dm approximates the
@@ -296,10 +386,10 @@ if __name__ == "__main__":
     print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
     methods = {
         "projected": dx_dm(nlp, M0, sol, "projected", rho_1=1e-4, rho_2=1e-4, tol=TOL),
-        "LS (c=0.1)": dx_dm(*(lambda n: (n, M0, n.solve(np.array([M0]), x_warmstart=x0)))(
+        "LS c0.1": dx_dm(*(lambda n: (n, M0, n.solve(np.array([M0]), x_warmstart=x0)))(
             build_dubins_nlp(N=N, integrator="euler", ic_scale=0.1)[0]),
             "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
-        "previous 1e-5": dx_dm(nlp, M0, sol, "regularized", rho_1=1e-5, rho_2=1e-5),
+        "uniform 1e-5": dx_dm(nlp, M0, sol, "regularized", rho_1=1e-5, rho_2=1e-5),
         # unregularized FD on the original (degenerate) problem itself, i.e. no
         # closest-point proximal term at all -- computed above as `warm`.
         "FD unregularized": warm,
@@ -317,18 +407,26 @@ if __name__ == "__main__":
         xt = xcp(M0 + dm)
         x_resolve = np.array(nlp.solve([M0 + dm], x_warmstart=xt).x).flatten()
         resolve_err = np.linalg.norm(x_resolve - xt)
-        errs = []
+        errs, errs_state = [], []
+        nXt = L["nXtot"]
         for v in methods.values():
             pred = x0 + dm * v
             errs.append(np.linalg.norm(pred - xt))
             errs.append(np.linalg.norm(pred - x_resolve))
-        taylor.append([dm, np.linalg.norm(xt - x0), resolve_err] + errs)
+            # same error restricted to the state trajectory (inputs excluded): for large dm
+            # the full-vector error is dominated by the few steering inputs that saturate,
+            # which the first-order prediction cannot capture
+            errs_state.append(np.linalg.norm(pred[:nXt] - xt[:nXt]))
+        taylor.append([dm, np.linalg.norm(xt - x0), resolve_err] + errs
+                      + [np.linalg.norm(xt[:nXt] - x0[:nXt])] + errs_state)
         print(f"    {dm:>8.0e} {np.linalg.norm(xt - x0):>13.3e} {resolve_err:>13.3e} "
               + " ".join(f"{e:>16.3e}" for e in errs))
     header = ("dm nominal resolve_err " +
-              " ".join(f"{k.replace(' ', '_')}_vs_xcp {k.replace(' ', '_')}_vs_solver" for k in methods))
-    np.savetxt(".results/dubins_taylor.dat", np.array(taylor), header=header, comments="")
-    print("    (saved to dubins_taylor.dat for pgfplots)")
+              " ".join(f"{k.replace(' ', '_')}_vs_xcp {k.replace(' ', '_')}_vs_solver" for k in methods)
+              + " nominal_states " + " ".join(f"{k.replace(' ', '_')}_vs_xcp_states" for k in methods))
+    np.savetxt(os.path.join(RESULTS_DIR, "dubins_taylor.dat"), np.array(taylor),
+               header=header, comments="")
+    print(f"    (saved to {RESULTS_DIR}/dubins_taylor.dat for pgfplots)")
 
     # ---------------- 7. data for the trajectory figure (position.tex) ----------------
     # Three trajectories, each written as two-column pgfplots tables (t, value) for the
@@ -339,7 +437,7 @@ if __name__ == "__main__":
     # The time axis is physical time t_k = k * sigma / (N+1), with sigma the time scaling
     # of that trajectory (for the prediction, sigma is itself predicted to first order,
     # so its time axis stretches accordingly).
-    PLOT_DIR = ".results"          # copy the files to Figures/Data/ (the path used in position.tex)
+    PLOT_DIR = RESULTS_DIR         # copy the files to Figures/Data/ (the path used in position.tex)
     PLOT_DM = 1e-1                 # parameter perturbation delta theta shown in the figure
     PLOT_RHO = 1e-4                # regularization of the derivative used for the prediction
     os.makedirs(PLOT_DIR, exist_ok=True)
@@ -380,3 +478,75 @@ if __name__ == "__main__":
     for name in ("x_pos", "y_pos", "a", "s"):
         v = np.concatenate([d[name] for d in data.values()])
         print(f"      {name:<6} [{v.min():+.3f}, {v.max():+.3f}]")
+    
+    # ---------------- 8. three-dimensional parameter ----------------
+    # theta = [m, p_x(T), p_y(T)]: the steering-bound scaling plus the terminal position.
+    # The reference is again the proximal central FD (one pair of solves per component),
+    # anchored at the nominal solution x0. Errors are relative Frobenius-norm errors of the
+    # full Jacobian dx/dtheta (n_x x 3); cosine similarity uses the Frobenius inner product.
+    # Least squares depends on the constraint scaling, so both methods are evaluated for
+    # every c in C_LIST (the paper uses c = 1, the other rows show the sensitivity to c).
+    print("\n--- 7. Three-dimensional parameter theta = [m, p_x(T), p_y(T)]")
+    nlp3, _ = build_dubins_nlp(N=N, integrator="euler", goal_as_param=True)
+    sol3 = nlp3.solve(THETA3, x_warmstart=x0)
+    print(f"    nominal re-solve: status={nlp3.solver.stats()['return_status']}, "
+          f"|x - x0| = {np.linalg.norm(np.array(sol3.x).flatten() - x0):.1e}")
+    prox3 = closest_point_solver(nlp3)
+    J_prox3, J_warm3 = fd_jacobians(nlp3, prox3, THETA3, x0, DELTA)
+    print(f"    consistency: column m of the FD Jacobian vs 1-D reference: {rel(J_prox3[:, 0], ref):.1e}")
+
+    th3_rows = [("warmFD", np.nan, rel(J_warm3, J_prox3), cos_sim(J_warm3, J_prox3), 0.0, 1.0)]
+    print(f"    {'method':<10} {'c':>6} {'err prox':>9} {'cos prox':>12} {'err warm':>9} {'cos warm':>12}")
+    for c in C_LIST:
+        nlp3_c = nlp3 if c == 1.0 else build_dubins_nlp(N=N, integrator="euler", ic_scale=c,
+                                                          goal_as_param=True)[0]
+        sol3_c = sol3 if c == 1.0 else nlp3_c.solve(THETA3, x_warmstart=x0)
+        for meth, J in [
+            ("projected", dx_dtheta(nlp3_c, THETA3, sol3_c, "projected", rho_1=RHO, rho_2=RHO, tol=TOL)),
+            ("lstsq", dx_dtheta(nlp3_c, THETA3, sol3_c, "active_set", tol=TOL, lstsq=True,
+                                active_rule="ratio")),
+        ]:
+            th3_rows.append((meth, c, rel(J, J_prox3), cos_sim(J, J_prox3),
+                             rel(J, J_warm3), cos_sim(J, J_warm3)))
+    for meth, c, ep, cp, ew, cw in th3_rows:
+        print(f"    {meth:<10} {c:>6.0e} {ep:>9.2e} {cp:>12.8f} {ew:>9.2e} {cw:>12.8f}")
+    with open(os.path.join(RESULTS_DIR, "dubins_theta3.dat"), "w") as fh:
+        fh.write("method c err_prox cos_prox err_warm cos_warm\n")
+        for meth, c, ep, cp, ew, cw in th3_rows:
+            fh.write(f"{meth} {c:.1e} {ep:.6e} {cp:.10f} {ew:.6e} {cw:.10f}\n")
+    print(f"    (saved to {RESULTS_DIR}/dubins_theta3.dat)")
+
+    # ---------------- 9. computation times ----------------
+    # Both methods start from the same nominal primal-dual solution, whose computation is
+    # not timed. "ours" = one call to the projected-regularization derivative (Hessian and
+    # Jacobian evaluation, subspace computation and linear solve). "fd" = central proximal
+    # finite differences as used for the reference: 2 * n_theta IPOPT solves, warm-started
+    # at the nominal solution. Each is repeated N_TIMING times after one untimed warm-up.
+    print(f"\n--- 8. Computation times ({N_TIMING} evaluations each, seconds)")
+
+    def prox_fd(prox_nlp, theta0):
+        """Central proximal FD Jacobian (timing only; no warm-FD companion solves)."""
+        J = np.zeros((nlp.n_x, theta0.size))
+        for j in range(theta0.size):
+            e = np.zeros(theta0.size)
+            e[j] = DELTA
+            xp = np.array(prox_nlp.solve(np.r_[theta0 + e, x0], x_warmstart=x0).x).flatten()
+            xm = np.array(prox_nlp.solve(np.r_[theta0 - e, x0], x_warmstart=x0).x).flatten()
+            J[:, j] = (xp - xm) / (2 * DELTA)
+        return J
+
+    time_rows = []
+    for nlp_t, sol_t, th0, prox_t in [(nlp, sol, np.array([M0]), prox), (nlp3, sol3, THETA3, prox3)]:
+        t_ours = time_it(lambda: dx_dtheta(nlp_t, th0, sol_t, "projected",
+                                           rho_1=RHO, rho_2=RHO, tol=TOL), N_TIMING)
+        t_fd = time_it(lambda: prox_fd(prox_t, th0), N_TIMING)
+        for meth, t in [("ours", t_ours), ("fd", t_fd)]:
+            time_rows.append((meth, th0.size, t.mean(), t.var(ddof=1), t.std(ddof=1), np.median(t)))
+    print(f"    {'method':<6} {'n_theta':>7} {'mean':>10} {'variance':>10} {'std':>10} {'median':>10}")
+    for meth, nth, mu, var, sd, med in time_rows:
+        print(f"    {meth:<6} {nth:>7d} {mu:>10.3e} {var:>10.3e} {sd:>10.3e} {med:>10.3e}")
+    with open(os.path.join(RESULTS_DIR, "dubins_times.dat"), "w") as fh:
+        fh.write("method n_theta mean var std median\n")
+        for meth, nth, mu, var, sd, med in time_rows:
+            fh.write(f"{meth} {nth:d} {mu:.6e} {var:.6e} {sd:.6e} {med:.6e}\n")
+    print(f"    (saved to {RESULTS_DIR}/dubins_times.dat)")
