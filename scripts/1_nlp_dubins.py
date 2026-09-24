@@ -6,7 +6,7 @@ import os
 import numpy as np
 import casadi as ca
 from time import perf_counter
-from typing import Union, Literal, Optional, Tuple, cast
+from typing import Callable, Literal, Optional, Tuple, cast
 
 from dbdnlp import DifferentiableNLP
 
@@ -26,7 +26,7 @@ SOLVER_OPTS = {
 }
 
 N = 150                     # number of time-steps
-M0 = 1.0                    # nominal mass
+M0 = 1.0                    # nominal steering-bound scaling m
 DELTA = 1e-5                # finite difference perturbation
 TOL = 1e-7                  # active-set tolerance (complementarity-aware rule)
 RHOS = [
@@ -43,8 +43,16 @@ C_LIST = [
 THETA3 = np.array([
     M0, 0.5, 0.25
 ])                          # nominal [m, p_x(T), p_y(T)] for the 3-parameter test
+TAYLOR_STEPS = [
+    1e-1, 3e-2, 1e-2,
+    3e-3, 1e-3, 3e-4,
+    1e-4
+]                           # step sizes dm for the Taylor test
 N_TIMING = 100              # number of evaluations to compute timings
 RESULTS_DIR = ".results"    # location of dat files
+PLOT_DIR = RESULTS_DIR      # location of trajectory tables (copy to Figures/Data/)
+PLOT_DM = 1e-1              # parameter perturbation shown in the trajectory figure
+PLOT_RHO = 1e-4             # regularization used for the figure's first-order prediction
 
 
 # helper to suppress casadi's type warnings
@@ -114,8 +122,17 @@ def euler(fc: ca.Function, x: ca.MX, u: ca.MX, m: ca.MX, T: ca.DM) -> ca.MX:
     -------
     ca.MX
         State at the end of the step, shape ``(nx, 1)``.
+
+    Notes
+    -----
+    With Euler the Dubins problem is structurally degenerate: steering at
+    standstill has no effect (the car starts at rest), and the last
+    steering input only changes the final heading, which is free. Both are
+    flat directions of the Lagrangian on the critical cone, so SSOSC fails
+    and the unregularized KKT matrix is singular. RK4's intermediate stages
+    give both inputs some authority, which removes the degeneracy.
     """
-    return x + T * fc(x, u, m)
+    return x + T * cast(ca.MX, fc(x, u, m))
 
 def build_dubins_nlp(
     N : int = 15,
@@ -291,7 +308,7 @@ def build_dubins_nlp(
 
     return nlp, dim_dict
 
-def unpack(z: ca.DM, L:dict[str, int]) -> Tuple[ca.DM, ca.DM]:
+def unpack(z: ca.DM | np.ndarray, L: dict[str, int]) -> Tuple[np.ndarray, np.ndarray]:
     """
     Split a flat primal vector into state and input trajectories.
  
@@ -314,8 +331,12 @@ def unpack(z: ca.DM, L:dict[str, int]) -> Tuple[ca.DM, ca.DM]:
     u : numpy.ndarray
         Input trajectory, shape ``(nu, N)``. Column ``k`` is interval ``k``.
     """
-    x = z[:L["nx_tot"]].reshape((L["nx"], L["N"] + 1))
-    u = z[L["nx_tot"]:].reshape((L["nu"], L["N"]))
+    # convert to a flat numpy vector (works for ca.DM and numpy input alike)
+    z = np.asarray(z, dtype=float).flatten()
+
+    # column-major reshape, matching ca.reshape in build_dubins_nlp
+    x = z[:L["nx_tot"]].reshape((L["nx"], L["N"] + 1), order="F")
+    u = z[L["nx_tot"]:].reshape((L["nu"], L["N"]), order="F")
     return x, u
 
 # =====================================================================
@@ -344,8 +365,9 @@ def compute_error(a:ca.DM | np.ndarray, b: ca.DM | np.ndarray) -> Tuple[float, f
     relative_error : float
         Relative error ``|a - b| / |b|``.
     """
-    # flatten
-    a, b = np.ravel(a), np.ravel(b)
+    # convert to numpy and flatten
+    a = np.asarray(a, dtype=float).ravel()
+    b = np.asarray(b, dtype=float).ravel()
 
     # relative error
     relative_error = float(np.linalg.norm(a - b) / np.linalg.norm(b))
@@ -399,6 +421,114 @@ def closest_point_solver(nlp: DifferentiableNLP, eps=1e-8) -> DifferentiableNLP:
     )
 
 
+
+# =====================================================================
+# FINITE-DIFFERENCE JACOBIANS
+# =====================================================================
+
+def fd_jacobians(
+    nlp: DifferentiableNLP,
+    prox: DifferentiableNLP,
+    theta0: np.ndarray,
+    x_bar: np.ndarray,
+    delta: float,
+    with_warm: bool = True
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Compute central finite-difference Jacobians ``dx/dtheta``.
+
+    Each parameter component is perturbed by ``+-delta`` in turn, which
+    costs two solves per component for each Jacobian.
+
+    Parameters
+    ----------
+    nlp : DifferentiableNLP
+        Original problem, with parameter `theta`.
+    prox : DifferentiableNLP
+        Closest-point variant of `nlp` (see `closest_point_solver`), with
+        parameter ``[theta; x_bar]``.
+    theta0 : numpy.ndarray
+        Nominal parameter, shape ``(n_theta,)``.
+    x_bar : numpy.ndarray
+        Anchor of the proximal term, usually the nominal solution. Also
+        used to warm-start the proximal solves.
+    delta : float
+        Finite-difference step.
+    with_warm : bool, default True
+        If False, skip the warm-started solves of `nlp` (e.g. for timing
+        the proximal reference alone).
+
+    Returns
+    -------
+    J_prox : numpy.ndarray
+        Finite differences of the proximal problem, shape ``(n_x, n_theta)``.
+    J_warm : numpy.ndarray or None
+        Finite differences of the original problem, warm-started at the
+        proximal solutions ``x^+`` and ``x^-``, shape ``(n_x, n_theta)``.
+        None if `with_warm` is False.
+    """
+    theta0 = np.atleast_1d(np.asarray(theta0, dtype=float))
+    n_theta = theta0.size
+
+    # allocate Jacobians
+    J_prox = np.zeros((nlp.n_x, n_theta))
+    J_warm = np.zeros((nlp.n_x, n_theta)) if with_warm else None
+
+    for j in range(n_theta):
+
+        # perturbation of the j-th parameter component
+        e = np.zeros(n_theta)
+        e[j] = delta
+
+        # proximal problem, warm-started at x_bar
+        xp = np.array(prox.solve(np.r_[theta0 + e, x_bar], x_warmstart=x_bar).x).flatten()
+        xm = np.array(prox.solve(np.r_[theta0 - e, x_bar], x_warmstart=x_bar).x).flatten()
+        J_prox[:, j] = (xp - xm) / (2 * delta)
+
+        # original problem, warm-started at the proximal solutions
+        if J_warm is not None:
+            wp = np.array(nlp.solve(ca.DM(theta0 + e), x_warmstart=xp).x).flatten()
+            wm = np.array(nlp.solve(ca.DM(theta0 - e), x_warmstart=xm).x).flatten()
+            J_warm[:, j] = (wp - wm) / (2 * delta)
+
+    return J_prox, J_warm
+
+
+# =====================================================================
+# TIMING
+# =====================================================================
+
+def time_it(fn: Callable[[], object], reps: int) -> np.ndarray:
+    """
+    Measure the wall-clock time of repeated calls.
+
+    One untimed warm-up call is made first, so that one-off costs (e.g.
+    CasADi function construction) are not included.
+
+    Parameters
+    ----------
+    fn : callable
+        Function to time, called without arguments.
+    reps : int
+        Number of timed calls.
+
+    Returns
+    -------
+    numpy.ndarray
+        Time of each call in seconds, shape ``(reps,)``.
+    """
+    # warm-up
+    fn()
+
+    # timed calls
+    t = np.empty(reps)
+    for i in range(reps):
+        t0 = perf_counter()
+        fn()
+        t[i] = perf_counter() - t0
+    return t
+
+
 # =====================================================================
 # MAIN
 # =====================================================================
@@ -428,7 +558,7 @@ if __name__ == "__main__":
         f"min eig of reduced Hessian={sub['min_reduced_eig']:.1e}"
     )
 
-    # print flat firections
+    # print flat directions
     for c in np.where(w > 0.5)[0]:
         top = np.argsort(-np.abs(V[:, c]))[:2]
         print("    flat direction along index " + ", ".join(f"{i} ({V[i, c]:+.2f})" for i in top))
@@ -511,3 +641,316 @@ if __name__ == "__main__":
         for meth, r, ep, ew in err_rows:
             fh.write(f"{meth} {r:.1e} {ep:.3e} {ew:.3e}\n")
     print(f"    (saved to {RESULTS_DIR}/dubins_errors.dat)")
+
+    # ---------------- 5. invariance to constraint scaling ----------------
+    # Rebuild the NLP with the initial-condition constraint scaled by c (a
+    # mathematically equivalent problem, see `init_scale`) and check that the
+    # projected-regularization derivative of s_0 (the flat, standstill steering
+    # direction) stays constant across c, while the least-squares one does not.
+    # s_0 is input 1 at interval 0: inputs come after the nx_tot state entries,
+    # so a_0 sits at nx_tot and s_0 right after it.
+    i_s0 = dim["nx_tot"] + 1
+    print("\n--- 4. Same problem, initial condition imposed as c * X[0:5,0] = 0")
+    print(
+        f"    {'c':>6} {'projected ds_0/dm':>18} {'err ref':>8} {'err warm':>9} "
+        f"{'LS ds_0/dm':>12} {'err ref':>8} {'err warm':>9}"
+    )
+
+    scaling = []
+    for c in C_LIST:
+
+        # build and solve the scaled problem
+        nlp_c, _ = build_dubins_nlp(N=N, integrator="euler", init_scale=c)
+        sol_c = nlp_c.solve(ca.DM(M0), x_warmstart=x0)
+
+        # projected method
+        projected_c = np.array(nlp_c.differentiate(
+            ca.DM(M0), sol_c.x, sol_c.lam, sol_c.nu,
+            mode="projected",
+            options={"rho_1":RHO, "rho_2":RHO, "tol":TOL}
+        )["x"]).flatten()
+
+        # least squares
+        least_squares_c = np.array(nlp_c.differentiate(
+            ca.DM(M0), sol_c.x, sol_c.lam, sol_c.nu,
+            mode="active_set",
+            options={"tol":TOL, "lstsq":True, "active_rule":"ratio"}
+        )["x"]).flatten()
+
+        # errors against both references
+        p_ref, p_warm = compute_error(projected_c, ref)[1], compute_error(projected_c, warm)[1]
+        l_ref, l_warm = compute_error(least_squares_c, ref)[1], compute_error(least_squares_c, warm)[1]
+
+        scaling.append([c, projected_c[i_s0], p_ref, p_warm, least_squares_c[i_s0], l_ref, l_warm])
+        print(
+            f"    {c:>6.0e} {projected_c[i_s0]:>18.2e} {p_ref:>8.1e} {p_warm:>9.1e} "
+            f"{least_squares_c[i_s0]:>12.4f} {l_ref:>8.1e} {l_warm:>9.1e}"
+        )
+
+    # tab:scaling (the table uses the *_prox columns; *_warm are for reference)
+    np.savetxt(
+        os.path.join(RESULTS_DIR, "dubins_scaling.dat"), np.array(scaling),
+        header="c proj_ds0 proj_err_prox proj_err_warm ls_ds0 ls_err_prox ls_err_warm",
+        comments="", fmt="%.6e"
+    )
+    print(f"    (saved to {RESULTS_DIR}/dubins_scaling.dat)")
+
+    # ---------------- 6. Taylor test ----------------
+    # For shrinking steps dm, check that x0 + dm * dx/dm approximates the
+    # closest-point re-solve x_cp(m + dm) to first order: for a correct
+    # derivative, the prediction error shrinks faster than |x_cp - x0|.
+    print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
+
+    # least squares is evaluated on the problem scaled with c = 0.1
+    nlp_ls, _ = build_dubins_nlp(N=N, integrator="euler", init_scale=0.1)
+    sol_ls = nlp_ls.solve(ca.DM(M0), x_warmstart=x0)
+
+    # derivatives to test (flat numpy vectors)
+    methods = {
+        "projected": np.array(nlp.differentiate(
+            ca.DM(M0), sol.x, sol.lam, sol.nu,
+            mode="projected",
+            options={"rho_1":RHO, "rho_2":RHO, "tol":TOL}
+        )["x"]).flatten(),
+        "LS c0.1": np.array(nlp_ls.differentiate(
+            ca.DM(M0), sol_ls.x, sol_ls.lam, sol_ls.nu,
+            mode="active_set",
+            options={"tol":TOL, "lstsq":True, "active_rule":"ratio"}
+        )["x"]).flatten(),
+        "uniform 1e-5": np.array(nlp.differentiate(
+            ca.DM(M0), sol.x, sol.lam, sol.nu,
+            mode="regularized",
+            options={"rho_1":1e-5, "rho_2":1e-5}
+        )["x"]).flatten(),
+        # FD of the original (degenerate) problem, no proximal term
+        "FD unregularized": np.array(warm).flatten(),
+    }
+
+    # Each prediction x0 + dm * v is checked against two targets: xt, the
+    # closest-point re-solve (well-posed reference), and x_resolve, the ORIGINAL
+    # (degenerate) problem re-solved at m + dm and warm-started at xt. If the
+    # original solver landed back on xt both errors would coincide; instead it
+    # typically drifts along the flat solution set, so the two can disagree.
+    print(
+        f"    {'dm':>8} {'|x(m+dm)-x0|':>13} {'|resolve-xt|':>13} "
+        + " ".join(f"{k + ' vs xcp':>16} {k + ' vs solver':>16}" for k in methods)
+    )
+
+    nx_tot = dim["nx_tot"]
+    taylor = []
+    for dm in TAYLOR_STEPS:
+
+        # targets
+        xt = np.array(xcp(M0 + dm)).flatten()
+        x_resolve = np.array(nlp.solve(ca.DM([M0 + dm]), x_warmstart=xt).x).flatten()
+        resolve_err = np.linalg.norm(x_resolve - xt)
+        nominal = np.linalg.norm(xt - x0)
+        nominal_states = np.linalg.norm(xt[:nx_tot] - x0[:nx_tot])
+
+        # prediction errors
+        errs, errs_state = [], []
+        for v in methods.values():
+            pred = x0 + dm * v
+            errs.append(np.linalg.norm(pred - xt))
+            errs.append(np.linalg.norm(pred - x_resolve))
+            # same error restricted to the states: for large dm the full error is
+            # dominated by the few steering inputs that saturate, which a
+            # first-order prediction cannot capture
+            errs_state.append(np.linalg.norm(pred[:nx_tot] - xt[:nx_tot]))
+
+        taylor.append([dm, nominal, resolve_err] + errs + [nominal_states] + errs_state)
+        print(
+            f"    {dm:>8.0e} {nominal:>13.3e} {resolve_err:>13.3e} "
+            + " ".join(f"{e:>16.3e}" for e in errs)
+        )
+
+    # fig:dubins_taylor
+    names = [k.replace(" ", "_") for k in methods]
+    header = (
+        "dm nominal resolve_err "
+        + " ".join(f"{k}_vs_xcp {k}_vs_solver" for k in names)
+        + " nominal_states "
+        + " ".join(f"{k}_vs_xcp_states" for k in names)
+    )
+    np.savetxt(
+        os.path.join(RESULTS_DIR, "dubins_taylor.dat"), np.array(taylor),
+        header=header, comments=""
+    )
+    print(f"    (saved to {RESULTS_DIR}/dubins_taylor.dat for pgfplots)")
+
+    # ---------------- 7. data for the trajectory figure (position.tex) ----------------
+    # Three trajectories, each written as two-column pgfplots tables (t, value) for
+    # the x-position, y-position, acceleration a and steering s:
+    #   suffix ""           : nominal solution x(m)
+    #   suffix "_m2"        : original NLP re-solved at m + dm, warm-started at x(m)
+    #   suffix "_m2_approx" : first-order prediction x(m) + dm * dx/dm (projected)
+    # The time axis is physical time t_k = k * sigma / (N + 1), with sigma the time
+    # dilation of that trajectory (for the prediction, sigma is itself predicted to
+    # first order, so its time axis stretches accordingly).
+    os.makedirs(PLOT_DIR, exist_ok=True)
+
+    def save_trajectory(z: np.ndarray, suffix: str) -> Tuple[float, dict[str, np.ndarray]]:
+        """Write x_pos, y_pos, a, s tables for primal vector z; return final time and series."""
+        x_traj, u_traj = unpack(z, dim)
+        t = np.arange(dim["N"] + 1) * x_traj[5, -1] / (dim["N"] + 1)
+
+        # inputs are held constant on [t_k, t_{k+1}): repeat the last one at t_N so
+        # that every curve spans [0, t_N] (use `const plot` in pgfplots)
+        series = {
+            "x_pos": x_traj[0],
+            "y_pos": x_traj[1],
+            "a": np.r_[u_traj[0], u_traj[0, -1]],
+            "s": np.r_[u_traj[1], u_traj[1, -1]],
+        }
+        for name, v in series.items():
+            np.savetxt(
+                os.path.join(PLOT_DIR, f"{name}{suffix}.tex"), np.column_stack([t, v]),
+                header="t v", comments="", fmt="%.10e"
+            )
+        return float(t[-1]), series
+
+    # re-solve at m + dm
+    sol_p = nlp.solve(ca.DM([M0 + PLOT_DM]), x_warmstart=x0)
+    status_p = nlp.solver.stats()["return_status"]
+    x_p = np.array(sol_p.x).flatten()
+
+    # first-order prediction
+    x_app = x0 + PLOT_DM * np.array(nlp.differentiate(
+        ca.DM(M0), sol.x, sol.lam, sol.nu,
+        mode="projected",
+        options={"rho_1":PLOT_RHO, "rho_2":PLOT_RHO, "tol":TOL}
+    )["x"]).flatten()
+
+    # write tables
+    tf, data = {}, {}
+    for label, z, suffix in [
+        ("nominal", x0, ""),
+        ("perturbed", x_p, "_m2"),
+        ("approx", x_app, "_m2_approx"),
+    ]:
+        tf[label], data[label] = save_trajectory(z, suffix)
+
+    # final time for the x-axis limit (xmax=\dubinsTf in position.tex)
+    with open(os.path.join(PLOT_DIR, "position_params.tex"), "w") as fh:
+        fh.write(f"\\def\\dubinsTf{{{max(tf.values()):.6f}}}%\n")
+
+    print(f"\n--- 6. Figure data (dm = {PLOT_DM:g}, rho = {PLOT_RHO:g}), saved to {PLOT_DIR}/")
+    print(f"    re-solve at m + dm: status={status_p}")
+    print("    final time        " + "  ".join(f"{k}={v:.4f}" for k, v in tf.items()))
+    print(f"    |x(m+dm) - x(m)|              = {np.linalg.norm(x_p - x0):.3e}")
+    print(f"    |x(m+dm) - x(m) - dm * dx/dm| = {np.linalg.norm(x_p - x_app):.3e}")
+    print("    data ranges (for the y-axis limits):")
+    for name in ("x_pos", "y_pos", "a", "s"):
+        v = np.concatenate([d[name] for d in data.values()])
+        print(f"      {name:<6} [{v.min():+.3f}, {v.max():+.3f}]")
+
+    # ---------------- 8. three-dimensional parameter ----------------
+    # theta = [m, p_x(T), p_y(T)]: the steering-bound scaling plus the terminal
+    # position. The reference is again the proximal central FD (one pair of solves
+    # per component), anchored at x0. Errors are relative Frobenius-norm errors of
+    # the full Jacobian dx/dtheta (n_x x 3), cosine similarity uses the Frobenius
+    # inner product. Least squares depends on the constraint scaling, so both
+    # methods are evaluated for every c in C_LIST (the paper uses c = 1).
+    print("\n--- 7. Three-dimensional parameter theta = [m, p_x(T), p_y(T)]")
+
+    # build and solve
+    nlp3, _ = build_dubins_nlp(N=N, integrator="euler", goal_as_param=True)
+    sol3 = nlp3.solve(ca.DM(THETA3), x_warmstart=x0)
+    print(
+        f"    nominal re-solve: status={nlp3.solver.stats()['return_status']}, "
+        f"|x - x0| = {np.linalg.norm(np.array(sol3.x).flatten() - x0):.1e}"
+    )
+
+    # finite-difference references
+    prox3 = closest_point_solver(nlp3)
+    J_prox3, J_warm3 = fd_jacobians(nlp3, prox3, THETA3, x0, DELTA)
+    J_warm3 = cast(np.ndarray, J_warm3)
+    print(f"    consistency: column m of the FD Jacobian vs 1-D reference: "
+          f"{compute_error(J_prox3[:, 0], ref)[1]:.1e}")
+
+    # rows: (method, c, err prox, cos prox, err warm, cos warm)
+    cos_wp, err_wp = compute_error(J_warm3, J_prox3)
+    th3_rows = [("warmFD", np.nan, err_wp, cos_wp, 0.0, 1.0)]
+
+    for c in C_LIST:
+
+        # reuse the nominal problem for c = 1, rebuild otherwise
+        if c == 1.0:
+            nlp3_c, sol3_c = nlp3, sol3
+        else:
+            nlp3_c, _ = build_dubins_nlp(N=N, integrator="euler", init_scale=c, goal_as_param=True)
+            sol3_c = nlp3_c.solve(ca.DM(THETA3), x_warmstart=x0)
+
+        # projected method
+        projected_3 = np.array(nlp3_c.differentiate(
+            ca.DM(THETA3), sol3_c.x, sol3_c.lam, sol3_c.nu,
+            mode="projected",
+            options={"rho_1":RHO, "rho_2":RHO, "tol":TOL}
+        )["x"]).reshape(nlp3_c.n_x, nlp3_c.n_theta)
+
+        # least squares
+        least_squares_3 = np.array(nlp3_c.differentiate(
+            ca.DM(THETA3), sol3_c.x, sol3_c.lam, sol3_c.nu,
+            mode="active_set",
+            options={"tol":TOL, "lstsq":True, "active_rule":"ratio"}
+        )["x"]).reshape(nlp3_c.n_x, nlp3_c.n_theta)
+
+        for meth, J in [("projected", projected_3), ("lstsq", least_squares_3)]:
+            cos_p, err_p = compute_error(J, J_prox3)
+            cos_w, err_w = compute_error(J, J_warm3)
+            th3_rows.append((meth, c, err_p, cos_p, err_w, cos_w))
+
+    print(f"    {'method':<10} {'c':>6} {'err prox':>9} {'cos prox':>12} {'err warm':>9} {'cos warm':>12}")
+    for meth, c, ep, cp, ew, cw in th3_rows:
+        print(f"    {meth:<10} {c:>6.0e} {ep:>9.2e} {cp:>12.8f} {ew:>9.2e} {cw:>12.8f}")
+
+    # 3-parameter test
+    with open(os.path.join(RESULTS_DIR, "dubins_theta3.dat"), "w") as fh:
+        fh.write("method c err_prox cos_prox err_warm cos_warm\n")
+        for meth, c, ep, cp, ew, cw in th3_rows:
+            fh.write(f"{meth} {c:.1e} {ep:.6e} {cp:.10f} {ew:.6e} {cw:.10f}\n")
+    print(f"    (saved to {RESULTS_DIR}/dubins_theta3.dat)")
+
+    # ---------------- 9. computation times ----------------
+    # Both methods start from the same nominal primal-dual solution, whose
+    # computation is not timed. "ours" = one call to the projected-regularization
+    # derivative (Hessian and Jacobian evaluation, subspace computation and linear
+    # solve). "fd" = central proximal finite differences as used for the reference:
+    # 2 * n_theta IPOPT solves, warm-started at the nominal solution. Each is
+    # repeated N_TIMING times after one untimed warm-up.
+    print(f"\n--- 8. Computation times ({N_TIMING} evaluations each, seconds)")
+
+    time_rows = []
+    for nlp_t, sol_t, th0, prox_t in [
+        (nlp, sol, np.array([M0]), prox),
+        (nlp3, sol3, THETA3, prox3),
+    ]:
+        # projected method
+        t_ours = time_it(
+            lambda: nlp_t.differentiate(
+                ca.DM(th0), sol_t.x, sol_t.lam, sol_t.nu,
+                mode="projected",
+                options={"rho_1":RHO, "rho_2":RHO, "tol":TOL}
+            ),
+            N_TIMING
+        )
+
+        # proximal finite differences (no warm-started companion solves)
+        t_fd = time_it(
+            lambda: fd_jacobians(nlp_t, prox_t, th0, x0, DELTA, with_warm=False),
+            N_TIMING
+        )
+
+        for meth, t in [("ours", t_ours), ("fd", t_fd)]:
+            time_rows.append((meth, th0.size, t.mean(), t.var(ddof=1), t.std(ddof=1), np.median(t)))
+
+    print(f"    {'method':<6} {'n_theta':>7} {'mean':>10} {'variance':>10} {'std':>10} {'median':>10}")
+    for meth, nth, mu, var, sd, med in time_rows:
+        print(f"    {meth:<6} {nth:>7d} {mu:>10.3e} {var:>10.3e} {sd:>10.3e} {med:>10.3e}")
+
+    # tab:comp_times
+    with open(os.path.join(RESULTS_DIR, "dubins_times.dat"), "w") as fh:
+        fh.write("method n_theta mean var std median\n")
+        for meth, nth, mu, var, sd, med in time_rows:
+            fh.write(f"{meth} {nth:d} {mu:.6e} {var:.6e} {sd:.6e} {med:.6e}\n")
+    print(f"    (saved to {RESULTS_DIR}/dubins_times.dat)")
