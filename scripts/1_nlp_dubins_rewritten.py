@@ -322,7 +322,7 @@ def unpack(z: ca.DM, L:dict[str, int]) -> Tuple[ca.DM, ca.DM]:
 # ERROR COMPUTATION
 # =====================================================================
 
-def compute_error(a:ca.DM | np.ndarray,b: ca.DM | np.ndarray) -> Tuple[float, float]:
+def compute_error(a:ca.DM | np.ndarray, b: ca.DM | np.ndarray) -> Tuple[float, float]:
     """
     Compare a vector or matrix against a reference.
 
@@ -471,19 +471,38 @@ if __name__ == "__main__":
 
     def row(label, v, method, rho=np.nan):
         """Print one comparison row (relative error of v against ref and warm) and store it."""
-        err_rows.append((method, rho, rel(v, ref), rel(v, warm)))
-        print(f"    {label:<26} {rel(v, ref):>10.1e} {rel(v, warm):>12.1e}")
+        err_rows.append((method, rho, compute_error(v, ref)[1], compute_error(v, warm)[1]))
+        print(f"    {label:<26} {compute_error(v, ref)[1]:>10.1e} {compute_error(v, warm)[1]:>12.1e}")
 
+    # references
     row("closest point (reference)", ref, "proxFD")
     row("warm-started IPOPT (FD)", warm, "warmFD")
+
+    # projected method
     for r in RHOS:
-        row(f"projected rho={r:.0e}", dx_dm(nlp, M0, sol, "projected", rho_1=r, rho_2=r, tol=TOL),
-            "projected", r)
-    row("least squares", dx_dm(nlp, M0, sol, "active_set", tol=TOL, lstsq=True, active_rule="ratio"),
-        "lstsq")
+        projected_result_rho = nlp.differentiate(
+            ca.DM(M0), sol.x, sol.lam, sol.nu, 
+            mode="projected", 
+            options={"rho_1":r, "rho_2":r, "tol":TOL}
+        )
+        row(f"projected rho={r:.0e}", projected_result_rho["x"], "projected", r)
+
+    # least squares
+    least_squares_result = nlp.differentiate(
+        ca.DM(M0), sol.x, sol.lam, sol.nu, 
+        mode="active_set",
+        options={"tol":TOL, "lstsq":True, "active_rule":"ratio"}
+    )
+    row("least squares", least_squares_result["x"], "lstsq")
+
+    # original method
     for r in RHOS:
-        row(f"previous (rho I) rho={r:.0e}", dx_dm(nlp, M0, sol, "regularized", rho_1=r, rho_2=r),
-            "uniform", r)
+        original_result_rho = nlp.differentiate(
+            ca.DM(M0), sol.x, sol.lam, sol.nu,
+            mode="regularized",
+            options={"rho_1":r, "rho_2":r}
+        )
+        row(f"previous (rho I) rho={r:.0e}", original_result_rho["x"], "uniform", r)
 
     # tab:dubins_errors. `nan` marks entries that are "--" in the table (no rho, or a
     # reference compared against itself). Readable with \pgfplotstableread.
