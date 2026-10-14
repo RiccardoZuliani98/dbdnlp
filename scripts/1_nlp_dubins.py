@@ -581,6 +581,24 @@ if __name__ == "__main__":
     # (degenerate) NLP re-solved from a warm start, for comparison.
     prox = closest_point_solver(nlp)
     xcp = lambda m: prox.solve(np.r_[m, x0], x_warmstart=x0).x
+
+    def resolve(m: float, z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Re-solve at parameter m around a (predicted) primal point z.
+
+        Returns the solution of the original NLP(m) warm-started at z, and of
+        the proximal NLP(m) anchored and warm-started at z. The original problem
+        is degenerate, so the first is whichever point of the solution set IPOPT
+        lands on; the second is the point of that set closest to z (up to O(eps)).
+        """
+        x_nlp = np.array(nlp.solve(ca.DM([m]), x_warmstart=z).x).flatten()
+        x_prox = np.array(prox.solve(np.r_[m, z], x_warmstart=z).x).flatten()
+        return x_nlp, x_prox
+
+    # cost of the original problem, f(x, theta)
+    f_fun = ca.Function("f_cost", [nlp.sym.primal, nlp.sym.param], [nlp.sym.cost])
+    f_cost = lambda z, m: float(cast(ca.DM, f_fun(z, m)))
+
     ref_plus = xcp(M0 + DELTA)
     ref_minus = xcp(M0 - DELTA)
     ref = (ref_plus - ref_minus) / (2 * DELTA)
@@ -697,9 +715,9 @@ if __name__ == "__main__":
 
     # ---------------- 6. Taylor test ----------------
     # For shrinking steps dm, check that x0 + dm * dx/dm approximates the
-    # closest-point re-solve x_cp(m + dm) to first order: for a correct
-    # derivative, the prediction error shrinks faster than |x_cp - x0|.
-    print("\n--- 5. First-order prediction error |x_cp(m+dm) - x0 - dm * dx/dm| (closest-point re-solves)")
+    # perturbed solution to first order: for a correct derivative, the
+    # prediction error shrinks faster than the distance of x0 itself.
+    print("\n--- 5. First-order prediction error of x0 + dm * dx/dm")
 
     # least squares is evaluated on the problem scaled with c = 0.1
     nlp_ls, _ = build_dubins_nlp(N=N, integrator="euler", init_scale=0.1)
@@ -726,51 +744,56 @@ if __name__ == "__main__":
         "FD unregularized": np.array(warm).flatten(),
     }
 
-    # Each prediction x0 + dm * v is checked against two targets: xt, the
-    # closest-point re-solve (well-posed reference), and x_resolve, the ORIGINAL
-    # (degenerate) problem re-solved at m + dm and warm-started at xt. If the
-    # original solver landed back on xt both errors would coincide; instead it
-    # typically drifts along the flat solution set, so the two can disagree.
-    print(
-        f"    {'dm':>8} {'|x(m+dm)-x0|':>13} {'|resolve-xt|':>13} "
-        + " ".join(f"{k + ' vs xcp':>16} {k + ' vs solver':>16}" for k in methods)
-    )
-
+    # Each prediction z = x0 + dm * v is checked against the two re-solves at
+    # m + dm returned by `resolve` (see section 3): the original NLP warm-started
+    # at z, and the proximal NLP anchored at z. The row "x0" is the zeroth-order
+    # prediction z = x0, for which the proximal target is x_cp(m + dm).
     nx_tot = dim["nx_tot"]
     taylor = []
     for dm in TAYLOR_STEPS:
 
-        # targets
-        xt = np.array(xcp(M0 + dm)).flatten()
-        x_resolve = np.array(nlp.solve(ca.DM([M0 + dm]), x_warmstart=xt).x).flatten()
-        resolve_err = np.linalg.norm(x_resolve - xt)
-        nominal = np.linalg.norm(xt - x0)
-        nominal_states = np.linalg.norm(xt[:nx_tot] - x0[:nx_tot])
-
-        # prediction errors
-        errs, errs_state = [], []
-        for v in methods.values():
+        # errors of x0 (nominal) and of each prediction, full vector and states only
+        # (for large dm the full error is dominated by the few steering inputs that
+        # saturate, which a first-order prediction cannot capture)
+        # together with the suboptimality f(x_prox) - f(x_nlp) of the proximal
+        # re-solve in the original problem, which certifies that it lands on the
+        # solution set (the constraints are the same, so it is feasible)
+        errs, errs_state, gaps = [], [], []
+        for v in [np.zeros_like(x0)] + list(methods.values()):
             pred = x0 + dm * v
-            errs.append(np.linalg.norm(pred - xt))
-            errs.append(np.linalg.norm(pred - x_resolve))
-            # same error restricted to the states: for large dm the full error is
-            # dominated by the few steering inputs that saturate, which a
-            # first-order prediction cannot capture
-            errs_state.append(np.linalg.norm(pred[:nx_tot] - xt[:nx_tot]))
+            x_nlp, x_prox = resolve(M0 + dm, pred)
+            for target in (x_nlp, x_prox):
+                errs.append(np.linalg.norm(pred - target))
+                errs_state.append(np.linalg.norm(pred[:nx_tot] - target[:nx_tot]))
+            gaps.append(f_cost(x_prox, M0 + dm) - f_cost(x_nlp, M0 + dm))
 
-        taylor.append([dm, nominal, resolve_err] + errs + [nominal_states] + errs_state)
-        print(
-            f"    {dm:>8.0e} {nominal:>13.3e} {resolve_err:>13.3e} "
-            + " ".join(f"{e:>16.3e}" for e in errs)
-        )
+        taylor.append([dm] + errs + errs_state + gaps)
+
+    # print one table per re-solve (columns: x0 first, then the methods)
+    for t, target in enumerate([
+        "original NLP(m+dm), warm-started at z",
+        "proximal NLP(m+dm), anchored and warm-started at z"
+    ]):
+        print(f"    |z - x| with x from the {target}")
+        print(f"    {'dm':>8} {'x0':>10} " + " ".join(f"{k:>16}" for k in methods))
+        for r in taylor:
+            print(
+                f"    {r[0]:>8.0e} {r[1 + t]:>10.3e} "
+                + " ".join(f"{e:>16.3e}" for e in r[3 + t : 3 + 2 * len(methods) : 2])
+            )
+    print("    suboptimality f(x_prox) - f(x_nlp) of the proximal re-solve")
+    print(f"    {'dm':>8} {'x0':>10} " + " ".join(f"{k:>16}" for k in methods))
+    for r in taylor:
+        gaps = r[-(len(methods) + 1):]
+        print(f"    {r[0]:>8.0e} {gaps[0]:>10.3e} " + " ".join(f"{e:>16.3e}" for e in gaps[1:]))
 
     # fig:dubins_taylor
-    names = [k.replace(" ", "_") for k in methods]
+    names = ["nominal"] + [k.replace(" ", "_") for k in methods]
     header = (
-        "dm nominal resolve_err "
-        + " ".join(f"{k}_vs_xcp {k}_vs_solver" for k in names)
-        + " nominal_states "
-        + " ".join(f"{k}_vs_xcp_states" for k in names)
+        "dm "
+        + " ".join(f"{k}_vs_nlp {k}_vs_prox" for k in names) + " "
+        + " ".join(f"{k}_vs_nlp_states {k}_vs_prox_states" for k in names) + " "
+        + " ".join(f"{k}_gap" for k in names)
     )
     np.savetxt(
         os.path.join(RESULTS_DIR, "dubins_taylor.dat"), np.array(taylor),
@@ -782,7 +805,7 @@ if __name__ == "__main__":
     # Three trajectories, each written as two-column pgfplots tables (t, value) for
     # the x-position, y-position, acceleration a and steering s:
     #   suffix ""           : nominal solution x(m)
-    #   suffix "_m2"        : original NLP re-solved at m + dm, warm-started at x(m)
+    #   suffix "_m2"        : original NLP re-solved at m + dm, warm-started at the prediction
     #   suffix "_m2_approx" : first-order prediction x(m) + dm * dx/dm (projected)
     # The time axis is physical time t_k = k * sigma / (N + 1), with sigma the time
     # dilation of that trajectory (for the prediction, sigma is itself predicted to
@@ -809,17 +832,18 @@ if __name__ == "__main__":
             )
         return float(t[-1]), series
 
-    # re-solve at m + dm
-    sol_p = nlp.solve(ca.DM([M0 + PLOT_DM]), x_warmstart=x0)
-    status_p = nlp.solver.stats()["return_status"]
-    x_p = np.array(sol_p.x).flatten()
-
     # first-order prediction
     x_app = x0 + PLOT_DM * np.array(nlp.differentiate(
         ca.DM(M0), sol.x, sol.lam, sol.nu,
         mode="projected",
         options={"rho_1":PLOT_RHO, "rho_2":PLOT_RHO, "tol":TOL}
     )["x"]).flatten()
+
+    # re-solves at m + dm around the prediction (see `resolve`); the figure shows
+    # the original NLP, the proximal one is only used for the error printout
+    x_p, x_p_prox = resolve(M0 + PLOT_DM, x_app)
+    status_p = nlp.solver.stats()["return_status"]
+    status_p_prox = prox.solver.stats()["return_status"]
 
     # write tables
     tf, data = {}, {}
@@ -835,10 +859,13 @@ if __name__ == "__main__":
         fh.write(f"\\def\\dubinsTf{{{max(tf.values()):.6f}}}%\n")
 
     print(f"\n--- 6. Figure data (dm = {PLOT_DM:g}, rho = {PLOT_RHO:g}), saved to {PLOT_DIR}/")
-    print(f"    re-solve at m + dm: status={status_p}")
+    print(f"    re-solve at m + dm: status original={status_p}, proximal={status_p_prox}")
     print("    final time        " + "  ".join(f"{k}={v:.4f}" for k, v in tf.items()))
-    print(f"    |x(m+dm) - x(m)|              = {np.linalg.norm(x_p - x0):.3e}")
-    print(f"    |x(m+dm) - x(m) - dm * dx/dm| = {np.linalg.norm(x_p - x_app):.3e}")
+    print(f"    |x(m+dm) - x(m)|              = {np.linalg.norm(x_p - x0):.3e} (original)")
+    print(
+        f"    |x(m+dm) - x(m) - dm * dx/dm| = {np.linalg.norm(x_p - x_app):.3e} (original), "
+        f"{np.linalg.norm(x_p_prox - x_app):.3e} (proximal)"
+    )
     print("    data ranges (for the y-axis limits):")
     for name in ("x_pos", "y_pos", "a", "s"):
         v = np.concatenate([d[name] for d in data.values()])

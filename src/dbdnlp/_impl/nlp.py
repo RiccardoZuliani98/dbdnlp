@@ -1,7 +1,9 @@
 import casadi as ca
 import numpy as np
-from typing import Dict, Optional, cast, Any
-from scipy.linalg import solve, null_space
+from typing import Dict, Optional, Tuple, cast, Any
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from scipy.linalg import solve, svd, qr, null_space
 from time import perf_counter
 
 from dbdnlp._impl.types import (
@@ -9,6 +11,10 @@ from dbdnlp._impl.types import (
     CostFuncType, IneqFuncType, EqFuncType, CstFuncType,
     LagrFuncType, KKTFuncType, IFTFuncType, ArrayLike
 )
+
+class _SparseKernelFailure(RuntimeError):
+    """Raised when the sparse null-space computation cannot certify its result."""
+
 
 class DifferentiableNLP:
     """
@@ -150,6 +156,9 @@ class DifferentiableNLP:
         
         self.solver = ca.nlpsol('solver', self.plugin, nlp_dict, self.opts)
 
+        # null-space dimensions of the last `degenerate_subspaces` call, see `_null_spaces`
+        self._null_space_hint: Optional[Tuple[int, int]] = None
+
     def solve(
         self,
         theta: ArrayLike,
@@ -285,6 +294,284 @@ class DifferentiableNLP:
             raise ValueError(f"expected {n} entries, got {d.numel()}")
         return ca.reshape(d, n, 1)
 
+    # ------------------------------------------------------------------
+    # Fast conversion and evaluation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sp(v: ArrayLike) -> sp.csc_matrix:
+        """CasADi matrix -> scipy CSC matrix.
+
+        `DM.sparse()` is two orders of magnitude faster than `DM.full()` for
+        large matrices (for a 1206 x 1206 Hessian ~0.5 ms vs ~80 ms), and
+        `.toarray()` on the result is cheap, so dense arrays are built this way too.
+        """
+        return ca.DM(v).sparse()
+
+    @classmethod
+    def _np(cls, v: ArrayLike) -> np.ndarray:
+        """CasADi matrix -> dense 2-D numpy array (fast path, see `_sp`)."""
+        return cls._sp(v).toarray()
+
+    def _eval_point(
+        self, theta: ArrayLike, x: ArrayLike, lam: ArrayLike, nu: ArrayLike
+    ) -> Dict[str, Any]:
+        """
+        Evaluates the IFT function and g once and returns sparse matrices.
+
+        Keys: H (n_x, n_x), H_xtheta, J_g, J_gtheta, J_h, J_htheta (all scipy
+        CSC), g (n_ineq,) and lam (n_ineq,) as flat numpy arrays.
+        """
+        H, H_xth, J_g, J_gth, J_h, J_hth = self.funcs.ift(x, lam, nu, theta)
+        g = self._np(self.funcs.ineq(x, theta)).ravel() if self.n_ineq > 0 else np.zeros(0)
+        return {
+            "H": self._sp(H),
+            "H_xtheta": self._sp(H_xth),
+            "J_g": self._sp(J_g),
+            "J_gtheta": self._sp(J_gth),
+            "J_h": self._sp(J_h),
+            "J_htheta": self._sp(J_hth),
+            "g": g,
+            "lam": self._np(self._col(lam, self.n_ineq)).ravel(),
+        }
+
+    # ------------------------------------------------------------------
+    # Null spaces of J (right and left) for `degenerate_subspaces`
+    # ------------------------------------------------------------------
+
+    # below this size of [0 J^T; J 0] the dense SVD is fast enough and is used
+    _SPARSE_MIN_SIZE = 300
+
+    @staticmethod
+    def _null_spaces_dense(J: Any, rcond: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Orthonormal bases of null(J) (n, d_Z) and null(J^T) (m, d_U) from a
+        single full SVD, with the same rank rule as `scipy.linalg.null_space`
+        (singular values <= rcond * s_max count as zero).
+        """
+        Jd = J.toarray() if sp.issparse(J) else np.asarray(J)
+        U, s, Vh = svd(Jd, full_matrices=True)
+        tol = float(np.max(s, initial=0.0)) * rcond
+        r = int(np.sum(s > tol))
+        return Vh[r:, :].T.copy(), U[:, r:].copy()
+
+    @staticmethod
+    def _norm2_estimate(
+        J: sp.spmatrix, rng: np.random.Generator, max_iter: int = 100, rtol: float = 1e-3
+    ) -> float:
+        """
+        Largest singular value of J, by power iteration on J^T J.
+
+        It only scales the zero threshold of the sparse null-space method, so a
+        relative accuracy of `rtol` is plenty. This is ~10x cheaper than `svds`,
+        whose ARPACK driver needs hundreds of matrix-vector products.
+        """
+        v = rng.standard_normal(J.shape[1])
+        s2, s2_old = 0.0, 0.0
+        for _ in range(max_iter):
+            v /= np.linalg.norm(v)
+            v = J.T @ (J @ v)
+            s2 = float(np.linalg.norm(v))
+            if s2 == 0.0 or abs(s2 - s2_old) <= rtol * s2:
+                break
+            s2_old = s2
+        return float(np.sqrt(s2))
+
+    @staticmethod
+    def _ritz_singular_values(B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """All b singular values (b,) of the m x b matrix B, also when m < b, and the
+        right singular vectors (b, b)."""
+        if B.shape[0] < B.shape[1]:
+            B = np.vstack([B, np.zeros((B.shape[1] - B.shape[0], B.shape[1]))])
+        _, s, Vh = np.linalg.svd(B, full_matrices=False)
+        return s, Vh.T
+
+    @classmethod
+    def _null_spaces_sparse(
+        cls,
+        J: sp.spmatrix,
+        rcond: float,
+        hint: Optional[Tuple[int, int]] = None,
+        seed: int = 0,
+        oversample: int = 8,
+        max_iter: int = 4,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Same output and rank rule as `_null_spaces_dense`, exploiting sparsity.
+
+        Uses one sparse LU of the quasi-definite matrix A = [delta I, J^T; J, -delta I].
+        Since A^2 = blkdiag(J^T J + delta^2 I, J J^T + delta^2 I), a solve with a block
+        [Q_Z; 0] returns delta (J^T J + delta^2 I)^{-1} Q_Z in its first block, and a
+        solve with [0; Q_U] returns -delta (J J^T + delta^2 I)^{-1} Q_U in its second
+        block. Each solve is thus a step of block inverse iteration on J^T J and on
+        J J^T (without forming them), which damps the component along a singular
+        value s by (delta / s)^2 relative to the null-space components. After
+        orthonormalizing the block Q, the singular values of J Q (resp. J^T Q) are
+        exactly |J z| for the Ritz vectors z, so those <= rcond * s_max are null
+        vectors under the same rule as the dense SVD.
+
+        Each block starts at the null-space dimension of `hint` (the result of the
+        previous call) or at the one forced by rank-nullity, |n - m|, plus
+        `oversample`. A block whose Ritz values are all near zero may be too small:
+        its null vectors are kept and a block twice as large, orthogonal to them,
+        is tried next (deflation).
+
+        Raises `_SparseKernelFailure` when the result cannot be certified; the
+        caller then falls back to the dense SVD.
+        """
+        m, n = J.shape
+        rng = np.random.default_rng(seed)
+        s_max = cls._norm2_estimate(J, rng)
+        if s_max == 0.0:
+            return np.eye(n), np.eye(m)
+
+        tau = rcond * s_max          # zero threshold, as in scipy.linalg.null_space
+        band = 1e3 * tau             # Ritz values in (tau_acc, band] may still be converging,
+        tau_acc = min(tau, 1e2 * np.finfo(float).eps * s_max)   # those below are at rounding level
+        delta = 1e-10 * s_max        # shift: far below the nonzero singular values, above rounding
+
+        A = sp.bmat([[delta * sp.eye(n), J.T], [J, -delta * sp.eye(m)]], format="csc")
+        lu = spla.splu(cast(sp.csc_matrix, A))
+
+        # side 0 is null(J) in R^n, side 1 is null(J^T) in R^m
+        dims = (n, m)
+        rows = (slice(0, n), slice(n, n + m))
+        ops = (J, J.T.tocsr())
+        found = [np.zeros((n, 0)), np.zeros((m, 0))]
+        start = hint if hint is not None else (max(n - m, 0), max(m - n, 0))
+        b = [start[0] + oversample, start[1] + oversample]
+        active = [True, True]
+
+        def deflate(Y: np.ndarray, F: np.ndarray) -> np.ndarray:
+            return Y - F @ (F.T @ Y) if F.shape[1] else Y
+
+        while active[0] or active[1]:
+            sides = [i for i in (0, 1) if active[i]]
+            for i in sides:
+                if found[i].shape[1] > dims[i] // 2:
+                    raise _SparseKernelFailure("null space too large for the sparse method")
+                b[i] = min(b[i], dims[i] - found[i].shape[1])
+
+            # both sides share each solve: right-hand side blkdiag(Q_Z, Q_U)
+            Q = {i: deflate(rng.standard_normal((dims[i], b[i])), found[i]) for i in sides}
+            cols = np.cumsum([0] + [b[i] for i in sides])
+            ritz = {}
+            for _ in range(max_iter):
+                R = np.zeros((n + m, cols[-1]))
+                for j, i in enumerate(sides):
+                    R[rows[i], cols[j]:cols[j + 1]] = Q[i]
+                X = lu.solve(R)
+                for j, i in enumerate(sides):
+                    Q[i] = qr(deflate(X[rows[i], cols[j]:cols[j + 1]], found[i]), mode="economic")[0]
+                    ritz[i] = cls._ritz_singular_values(ops[i] @ Q[i])
+                if not any(np.any((s > tau_acc) & (s <= band)) for s, _ in ritz.values()):
+                    break
+
+            for i in sides:
+                s, V = ritz[i]
+                found[i] = np.hstack([found[i], Q[i] @ V[:, s <= tau]])
+                if np.sum(s <= band) < b[i]:
+                    active[i] = False   # a Ritz value beyond the band: the block was large enough
+                else:
+                    b[i] *= 2
+
+        Z, N_U = found
+        if Z.shape[1] - N_U.shape[1] != n - m:   # rank-nullity check
+            raise _SparseKernelFailure("inconsistent null-space dimensions")
+        return Z, N_U
+
+    def _null_spaces(
+        self, J: sp.spmatrix, rank_tol: Optional[float], method: str
+    ) -> Tuple[np.ndarray, np.ndarray, str]:
+        """Dispatches to the sparse or dense null-space routine, see `degenerate_subspaces`."""
+        m, n = J.shape
+        rcond = rank_tol if rank_tol else np.finfo(float).eps * max(m, n)
+        if method not in ("auto", "sparse", "dense"):
+            raise ValueError(f"Unknown null-space method '{method}'. Choose 'auto', 'sparse' or 'dense'.")
+        used = "dense"
+        if method == "sparse" or (method == "auto" and m + n >= self._SPARSE_MIN_SIZE):
+            try:
+                Z, N_U = self._null_spaces_sparse(J, rcond, hint=self._null_space_hint)
+                used = "sparse"
+            except (_SparseKernelFailure, RuntimeError, ValueError):
+                pass  # fall back to the dense SVD
+        if used == "dense":
+            Z, N_U = self._null_spaces_dense(J, rcond)
+        # repeated calls (e.g. timing, or a sweep over theta) have similar null
+        # spaces: their dimensions size the first block of the next sparse call
+        self._null_space_hint = (Z.shape[1], N_U.shape[1])
+        return Z, N_U, used
+
+    def _subspace_bases(
+        self,
+        ev: Dict[str, Any],
+        active_tol: float,
+        rank_tol: Optional[float],
+        flat_tol: float,
+        weak_as_active: bool,
+        active_rule: str,
+        method: str,
+    ) -> Dict[str, Any]:
+        """Core of `degenerate_subspaces`, working on the output of `_eval_point`.
+
+        Returns orthonormal bases B_P (n_x, dim_P) and N_U (n_m, dim_U) instead of
+        the dense projectors.
+        """
+        t0 = perf_counter()
+        H = 0.5 * (ev["H"] + ev["H"].T)
+        g_np, lam_np = ev["g"], ev["lam"]
+
+        active = self._active_set(g_np, lam_np, active_tol, active_rule)
+        strong = active[lam_np[active] > active_tol] if active.size else active
+        weak = np.setdiff1d(active, strong)
+        sys_idx = active if weak_as_active else strong
+
+        J_sys = cast(sp.csc_matrix, sp.vstack([ev["J_g"][sys_idx, :], ev["J_h"]], format="csc"))
+        n_m = J_sys.shape[0]
+        t1 = perf_counter()
+
+        # --- U and null(J_sys) ---------------------------------------------
+        if n_m > 0:
+            Z, N_U, used = self._null_spaces(J_sys, rank_tol, method)
+        else:
+            Z, N_U, used = np.eye(self.n_x), np.zeros((0, 0)), "none"
+        t2 = perf_counter()
+
+        # --- P: flat directions of H on null(J_sys) --------------------------
+        min_eig, gap = np.inf, np.inf
+        B_P = np.zeros((self.n_x, 0))
+        if Z.shape[1] > 0:
+            H_red = Z.T @ (H @ Z)
+            H_red = 0.5 * (H_red + H_red.T)
+            w, W = np.linalg.eigh(H_red)
+            scale = max(1.0, float(np.max(np.abs(w))))
+            flat = np.abs(w) <= flat_tol * scale
+            min_eig = float(w[0])
+            if np.any(~flat):
+                gap = float(np.min(np.abs(w[~flat])))
+            if np.any(flat):
+                B_P = Z @ W[:, flat]
+        t3 = perf_counter()
+
+        return {
+            "B_P": B_P,
+            "N_U": N_U if N_U.size else np.zeros((n_m, 0)),
+            "dim_P": int(B_P.shape[1]),
+            "dim_U": int(N_U.shape[1]) if N_U.size else 0,
+            "sys_idx": sys_idx,
+            "active_idx": active,
+            "strong_idx": strong,
+            "weak_idx": weak,
+            "min_reduced_eig": min_eig,
+            "smallest_nonflat_eig": gap,
+            "null_space_method": used,
+            "timing": {
+                "active_set": t1 - t0,
+                "null_spaces": t2 - t1,
+                "reduced_hessian": t3 - t2,
+            },
+        }
+
     def differentiate(
         self,
         theta: ArrayLike,
@@ -317,7 +604,10 @@ class DifferentiableNLP:
             - "regularized": Previous regularization (rho_1 * I, rho_2 * I).
             - "projected": Current regularization (rho_1 * Pi_P, rho_2 * Pi_U),
                            see `degenerate_subspaces`. Options: rho_1, rho_2,
-                           active_tol, rank_tol, flat_tol, weak_as_active.
+                           active_tol, rank_tol, flat_tol, weak_as_active,
+                           null_space_method ('auto', 'sparse' or 'dense').
+                           The system is solved with a sparse LU, using the
+                           low-rank structure of Pi_P and Pi_U.
         options : Optional[Dict[str, Any]], optional
             Dictionary of options (e.g., {'tol': 1e-5} for active set thresholding).
 
@@ -332,27 +622,22 @@ class DifferentiableNLP:
         opts = options or {}
         tol: float = opts.get("tol", 1e-5)
 
-        # 1. Evaluate IFT Jacobians & Hessians using precompiled functions
-        H_xx_eval, H_xtheta_eval, J_gx_eval, J_gtheta_eval, J_hx_eval, J_htheta_eval = \
-            self.funcs.ift(x, lam, nu, theta)
-
-        g_eval = self.funcs.ineq(x, theta) if self.n_ineq > 0 else np.zeros((0, 1))
-
-        # 2. Convert CasADi matrices to NumPy arrays for assembly and slicing
-        H_xx_np = np.array(ca.DM(H_xx_eval).full())
-        H_xtheta_np = np.array(ca.DM(H_xtheta_eval).full())
-
-        J_gx_np = np.array(ca.DM(J_gx_eval).full())
-        J_gtheta_np = np.array(ca.DM(J_gtheta_eval).full())
-
-        J_hx_np = np.array(ca.DM(J_hx_eval).full())
-        J_htheta_np = np.array(ca.DM(J_htheta_eval).full())
-
-        g_np = np.array(ca.DM(g_eval).full()).flatten()
-        lam_np = np.array(ca.DM(lam).full()).flatten()
+        # 1. Evaluate IFT Jacobians & Hessians once, as sparse matrices
+        #    (DM.full() is very slow on large matrices, DM.sparse() is not)
+        ev = self._eval_point(theta, x, lam, nu)
+        g_np, lam_np = ev["g"], ev["lam"]
 
         n_x, n_theta = self.n_x, self.n_theta
         n_ineq, n_eq = self.n_ineq, self.n_eq
+
+        # 2. Dense copies for the dense modes (the projected mode stays sparse)
+        if mode in ("full", "active_set", "regularized"):
+            H_xx_np     = ev["H"].toarray()
+            H_xtheta_np = ev["H_xtheta"].toarray()
+            J_gx_np     = ev["J_g"].toarray()
+            J_gtheta_np = ev["J_gtheta"].toarray()
+            J_hx_np     = ev["J_h"].toarray()
+            J_htheta_np = ev["J_htheta"].toarray()
 
         # 3. Assemble and Solve Linear System M * d = -N_rhs
         if mode == "full":
@@ -494,32 +779,66 @@ class DifferentiableNLP:
             if rho_1 is None or rho_2 is None:
                 raise ValueError("Options 'rho_1' and 'rho_2' must be provided for 'projected' mode.")
 
-            sub = self.degenerate_subspaces(
-                theta, x, lam, nu,
+            sub = self._subspace_bases(
+                ev,
                 active_tol=opts.get("active_tol", tol),
                 rank_tol=opts.get("rank_tol", None),
                 flat_tol=opts.get("flat_tol", 1e-9),
                 weak_as_active=opts.get("weak_as_active", True),
                 active_rule=opts.get("active_rule", "ratio"),
+                method=opts.get("null_space_method", "auto"),
             )
-
-            # print(sub["timing"])
 
             sys_idx = sub["sys_idx"]
             n_sys = len(sys_idx)
 
-            J_sys = np.vstack([J_gx_np[sys_idx, :], J_hx_np])
-            J_sys_theta = np.vstack([J_gtheta_np[sys_idx, :], J_htheta_np])
+            J_sys = sp.vstack([ev["J_g"][sys_idx, :], ev["J_h"]], format="csc")
+            J_sys_theta = sp.vstack([ev["J_gtheta"][sys_idx, :], ev["J_htheta"]]).toarray()
             n_m = J_sys.shape[0]
 
-            M = np.zeros((n_x + n_m, n_x + n_m))
-            M[:n_x, :n_x] = H_xx_np + rho_1 * sub["Pi_P"]
-            M[:n_x, n_x:] = J_sys.T
-            M[n_x:, :n_x] = J_sys
-            M[n_x:, n_x:] = -rho_2 * sub["Pi_U"]
-            N_rhs = np.vstack([H_xtheta_np, J_sys_theta])
+            # Pi_P = B_P B_P^T and Pi_U = N_U N_U^T are dense, so M is not formed.
+            # With K_P = [H + rho_1 Pi_P, J_sys^T; J_sys, 0]:
+            #  - (0, N_U) is an invariant subspace of M with eigenvalue -rho_2
+            #    (J_sys^T N_U = 0), so the U-part of the solution is explicit,
+            #    dpsi_U = -Pi_U rhs_psi / rho_2, and on the orthogonal complement M
+            #    coincides with K_P.
+            #  - The kernel of K_P is (0, N_U). Diagonal entries -gamma on rows S of
+            #    the multiplier block, with N_U[S] nonsingular, make K_P nonsingular
+            #    without changing the solution for a right-hand side orthogonal to
+            #    (0, N_U), up to a kernel component, which is projected out.
+            #  - rho_1 Pi_P enters as a border of dim(P) dense columns,
+            #      [ A      W_P ]          W_P = [sqrt(rho_1) B_P; 0],
+            #      [ W_P^T  -I  ],         eliminating the border adds W_P W_P^T to A.
+            # This keeps the LU sparse: only the few columns of B_P are dense,
+            # while bordering with N_U as well causes a lot of fill-in.
+            B_P, N_U = sub["B_P"], sub["N_U"]
+            n_p, n_u = B_P.shape[1], N_U.shape[1]
+            if (n_p > 0 and rho_1 == 0) or (n_u > 0 and rho_2 == 0):
+                raise np.linalg.LinAlgError("projected KKT matrix is singular: rho = 0 on a degenerate subspace")
 
-            d_p = solve(M, -N_rhs, assume_a='sym')
+            rhs = np.vstack([-ev["H_xtheta"].toarray(), -J_sys_theta])
+            rhs_U = N_U @ (N_U.T @ rhs[n_x:]) if n_u > 0 else np.zeros((n_m, n_theta))
+            rhs[n_x:] -= rhs_U
+
+            if n_u > 0:
+                S = qr(N_U.T, mode="r", pivoting=True)[1][:n_u]
+                gamma = float(abs(J_sys).max()) or 1.0   # any nonzero value works, this one matches J
+                D_S = sp.csc_matrix((-gamma * np.ones(n_u), (S, S)), shape=(n_m, n_m))
+            else:
+                D_S = sp.csc_matrix((n_m, n_m))
+            A = sp.bmat([[ev["H"], J_sys.T], [J_sys, D_S]], format="csc")
+            if n_p > 0:
+                W_P = sp.csc_matrix(np.vstack([np.sqrt(rho_1) * B_P, np.zeros((n_m, n_p))]))
+                A = sp.bmat([[A, W_P], [W_P.T, -sp.eye(n_p)]], format="csc")
+                rhs = np.vstack([rhs, np.zeros((n_p, n_theta))])
+
+            try:
+                d_p = spla.splu(cast(sp.csc_matrix, A)).solve(rhs)[:n_x + n_m]
+            except RuntimeError as err:  # SuperLU: "Factor is exactly singular"
+                raise np.linalg.LinAlgError(str(err)) from err
+
+            if n_u > 0:
+                d_p[n_x:] -= N_U @ (N_U.T @ d_p[n_x:]) + rhs_U / rho_2
 
             dx = d_p[:n_x, :]
             dlam = np.zeros((n_ineq, n_theta))
@@ -577,14 +896,11 @@ class DifferentiableNLP:
             n_active, n_weakly_active, sosc_exact, and kkt_residual.
         """
         # --- 1. Reuse the eagerly compiled ift function -------------------------
-        H_L_dm, _, J_g_dm, _, J_h_dm, _ = self.funcs.ift(x, lam, nu, theta)
-
-        H_L = np.array(ca.DM(H_L_dm).full()).reshape(self.n_x, self.n_x)
-        J_g = np.array(ca.DM(J_g_dm).full()).reshape(self.n_ineq, self.n_x)
-        J_h = np.array(ca.DM(J_h_dm).full()).reshape(self.n_eq, self.n_x)
-
-        g_np = np.array(ca.DM(self.funcs.ineq(x, theta)).full()).flatten()
-        lam_np = np.array(ca.DM(lam).full()).flatten()
+        ev = self._eval_point(theta, x, lam, nu)
+        H_L = ev["H"].toarray()
+        J_g = ev["J_g"].toarray()
+        J_h = ev["J_h"].toarray()
+        g_np, lam_np = ev["g"], ev["lam"]
 
         # --- 2. Guard: these conditions are only meaningful at a KKT point ------
         stat, _, eq, _, dual_feas = self.funcs.kkt(x, lam, nu, theta)
@@ -668,6 +984,7 @@ class DifferentiableNLP:
         flat_tol: float = 1e-9,
         weak_as_active: bool = True,
         active_rule: str = "ratio",
+        null_space_method: str = "auto",
     ) -> Dict[str, Any]:
         """
         Computes the orthogonal projectors onto the degenerate subspaces U and P
@@ -691,96 +1008,45 @@ class DifferentiableNLP:
         derivatives). With False they are dropped and P is computed on K_+, as in
         Corollary 3.2. Under SCS both choices coincide.
 
+        Null spaces: both null(J_sys) and null(J_sys^T) use the rank rule of
+        `scipy.linalg.null_space` (singular values <= rank_tol * s_max are zero,
+        rank_tol=None meaning eps * max(shape)). With null_space_method="dense"
+        they come from one full SVD of J_sys. With "sparse" they come from block
+        inverse iteration on J^T J and J J^T, through one sparse LU of
+        [delta I, J^T; J, -delta I] (see `_null_spaces_sparse`); this is much
+        faster when the null spaces are small compared to J (the usual case), and
+        falls back to the dense SVD when it cannot certify its result. "auto"
+        (default) uses "sparse" except for small matrices.
+
         Returns
         -------
-        Dict with keys: Pi_P (n_x, n_x), Pi_U (n_m, n_m), dim_P, dim_U,
-        sys_idx, active_idx, strong_idx, weak_idx, min_reduced_eig (negative
-        values of significant size indicate that Assumption 3.1 fails),
-        smallest_nonflat_eig (gap to the flat eigenvalues, useful to sanity
-        check flat_tol).
+        Dict with keys: Pi_P (n_x, n_x), Pi_U (n_m, n_m), B_P (n_x, dim_P) and
+        N_U (n_m, dim_U) orthonormal bases with Pi_P = B_P B_P^T and
+        Pi_U = N_U N_U^T, dim_P, dim_U, sys_idx, active_idx, strong_idx,
+        weak_idx, min_reduced_eig (negative values of significant size indicate
+        that Assumption 3.1 fails), smallest_nonflat_eig (gap to the flat
+        eigenvalues, useful to sanity check flat_tol), null_space_method (the
+        method actually used) and timing.
         """
+        t0 = perf_counter()
+        ev = self._eval_point(theta, x, lam, nu)
+        t1 = perf_counter()
 
-        start_time = perf_counter()
+        sub = self._subspace_bases(
+            ev,
+            active_tol=active_tol,
+            rank_tol=rank_tol,
+            flat_tol=flat_tol,
+            weak_as_active=weak_as_active,
+            active_rule=active_rule,
+            method=null_space_method,
+        )
+        sub["Pi_P"] = sub["B_P"] @ sub["B_P"].T
+        sub["Pi_U"] = sub["N_U"] @ sub["N_U"].T
+        t2 = perf_counter()
 
-        H_dm, _, Jg_dm, _, Jh_dm, _ = self.funcs.ift(x, lam, nu, theta)
-        H = np.array(ca.DM(H_dm).full()).reshape(self.n_x, self.n_x)
-        H = 0.5 * (H + H.T)
-        J_g = np.array(ca.DM(Jg_dm).full()).reshape(self.n_ineq, self.n_x)
-        J_h = np.array(ca.DM(Jh_dm).full()).reshape(self.n_eq, self.n_x)
-
-        g_np = np.array(ca.DM(self.funcs.ineq(x, theta)).full()).flatten()
-        lam_np = np.array(ca.DM(lam).full()).flatten()
-
-        convert_time_end = perf_counter()
-
-        active = self._active_set(g_np, lam_np, active_tol, active_rule)
-        strong = active[lam_np[active] > active_tol] if active.size else active
-        weak = np.setdiff1d(active, strong)
-        sys_idx = active if weak_as_active else strong
-
-        J_sys = np.vstack([J_g[sys_idx, :], J_h])
-        n_m = J_sys.shape[0]
-
-        active_set_time_end = perf_counter()
-
-        # --- U: left null space of J_sys --------------------------------------
-        if n_m > 0:
-            N_U = null_space(J_sys.T, rcond=rank_tol) if rank_tol else null_space(J_sys.T)
-        else:
-            N_U = np.zeros((0, 0))
-        Pi_U = N_U @ N_U.T if N_U.size else np.zeros((n_m, n_m))
-
-        j_sys_null_time_end = perf_counter()
-
-        # --- P: flat directions of H on null(J_sys) ---------------------------
-        if n_m > 0:
-            Z = null_space(J_sys, rcond=rank_tol) if rank_tol else null_space(J_sys)
-        else:
-            Z = np.eye(self.n_x)
-
-        flat_directions_end = perf_counter()
-
-        min_eig, gap = np.inf, np.inf
-        Pi_P = np.zeros((self.n_x, self.n_x))
-        dim_P = 0
-        if Z.shape[1] > 0:
-            H_red = Z.T @ H @ Z
-            H_red = 0.5 * (H_red + H_red.T)
-            w, W = np.linalg.eigh(H_red)
-            scale = max(1.0, float(np.max(np.abs(w))))
-            flat = np.abs(w) <= flat_tol * scale
-            min_eig = float(w[0])
-            if np.any(~flat):
-                gap = float(np.min(np.abs(w[~flat])))
-            if np.any(flat):
-                B_P = Z @ W[:, flat]
-                Pi_P = B_P @ B_P.T
-                dim_P = int(flat.sum())
-
-        assemble_end = perf_counter()
-
-        tot_time = {
-            "convert":      convert_time_end - start_time,
-            "active_set":   active_set_time_end - convert_time_end,
-            "j_sys_null":   j_sys_null_time_end - active_set_time_end,
-            "flat_dir":     flat_directions_end - j_sys_null_time_end,
-            "assemble":     assemble_end - flat_directions_end,
-            "total":        assemble_end - start_time
-        }
-
-        return {
-            "Pi_P": Pi_P,
-            "Pi_U": Pi_U,
-            "dim_P": dim_P,
-            "dim_U": int(N_U.shape[1]) if N_U.size else 0,
-            "sys_idx": sys_idx,
-            "active_idx": active,
-            "strong_idx": strong,
-            "weak_idx": weak,
-            "min_reduced_eig": min_eig,
-            "smallest_nonflat_eig": gap,
-            "timing": tot_time
-        }
+        sub["timing"] = {"convert": t1 - t0, **sub["timing"], "total": t2 - t0}
+        return sub
 
     def annotate_solution(self, sol: "NLPSolution", **kwargs) -> Dict[str, Any]:
         """Thin wrapper: evaluate properties at `sol` and store them on it."""
