@@ -23,6 +23,8 @@ The script:
        - "projected"   : current method (rho_1 Pi_P, rho_2 Pi_U), rho sweeps
        - "regularized" : previous method (rho I), rho sweep
        - "lstsq"       : unregularized KKT system solved in the least-squares sense
+       - "prox"        : proximal anchoring (eps/2) ||x - x_bar||^2 on all primal variables,
+                         KKT system solved in the least-squares sense, eps sweep
   4. compares them to finite differences and to the m = 1 reference.
 
 Results are saved to mpc_overactuated_results.npz and a preview figure, and exported
@@ -690,8 +692,8 @@ def run(
     Simulates the ``m = 1`` and over-actuated closed loops, characterizes
     their degeneracy, computes finite-difference and reference
     sensitivities, then sweeps the "projected" and "regularized" (old)
-    sensitivity methods over `rho_grid` and evaluates the unregularized
-    least-squares and plain solves.
+    sensitivity methods and proximal anchoring (``eps = rho``) over
+    `rho_grid` and evaluates the unregularized least-squares and plain solves.
 
     Parameters
     ----------
@@ -735,7 +737,7 @@ def run(
           `m` and ``m = 1`` actuators, shape ``(T + 1, 2)``,
         - ``"dref"`` : ``m = 1`` reference sensitivity (projected method),
           shape ``(T + 1, 2)``,
-        - ``"proj_rho1"``, ``"proj_rho2"``, ``"old"`` : sweep results, shape
+        - ``"proj_rho1"``, ``"proj_rho2"``, ``"old"``, ``"prox"`` : sweep results, shape
           ``(len(rho_grid), 4)``, columns (err vs FD, err vs reference,
           cosine similarity vs FD, ms per MPC instance), NaN where the solve
           failed,
@@ -830,7 +832,7 @@ def run(
     if verbose:
         print(f"\n  {'method':<30} {'err vs FD':>11} {'err vs ref':>11} {'cos(FD)':>9} {'ms/inst':>9}")
 
-    sweeps = {"proj_rho1": [], "proj_rho2": [], "old": []}
+    sweeps = {"proj_rho1": [], "proj_rho2": [], "old": [], "prox": []}
 
     # projected method, sweep rho_1 (rho_2 fixed)
     for r in rho_grid:
@@ -858,6 +860,15 @@ def run(
             {"rho_1":r, "rho_2":r}
         )
         sweeps["old"].append(report(f"old rho*I  rho={r:.0e}", d))
+
+    # proximal anchoring + least squares (same active set as the projected method)
+    for r in rho_grid:
+        d = safe_propagate(
+            nlpm, Lm, theta, xsm, usm, solsm,
+            "active_set",
+            {"tol":ACTIVE_TOL, "active_rule":"ratio", "lstsq":True, "prox":r}
+        )
+        sweeps["prox"].append(report(f"prox+lstsq eps={r:.0e}", d))
 
     # least squares
     d_ls = safe_propagate(
@@ -926,6 +937,7 @@ def plot(res: dict[str, Any], rho_grid: np.ndarray, T: int, fname: str) -> None:
     a.loglog(rho_grid, res["proj_rho1"][:, 1], "o-", label=r"projected, sweep $\rho_1$")
     a.loglog(rho_grid, res["proj_rho2"][:, 1], "s--", label=r"projected, sweep $\rho_2$")
     a.loglog(rho_grid, res["old"][:, 1], "^-", label=r"previous ($\rho I$)")
+    a.loglog(rho_grid, res["prox"][:, 1], "v-", label=r"proximal + least squares ($\epsilon = \rho$)")
     if np.isfinite(res["lstsq"][1]):
         a.axhline(res["lstsq"][1], color="k", ls=":", label="least squares")
     a.axhline(rel_err(res["dfd"], res["dref"]), color="gray", ls="-.", lw=1, label="finite differences")
@@ -1075,7 +1087,7 @@ def export_dat(
 
     # ---- rho sweep: columns <method>_err_fd, <method>_err_ref, <method>_cos ----
     cols = {"rho": rho_grid}
-    for key in ("proj_rho1", "proj_rho2", "old"):
+    for key in ("proj_rho1", "proj_rho2", "old", "prox"):
         s = res[key]   # (len(rho_grid), 4): err vs FD, err vs ref, cos vs FD, ms/instance
         cols.update({
             f"{key}_err_fd": s[:, 0], f"{key}_err_ref": s[:, 1],
@@ -1092,7 +1104,8 @@ def export_dat(
     write_dat(
         os.path.join(out_dir, "rho_sweep.dat"), cols,
         info + "\nproj_rho1: sweep rho_1 (rho_2 fixed), proj_rho2: sweep rho_2 (rho_1 fixed), "
-               "old: rho*I regularization\nnan = solve failed"
+               "old: rho*I regularization, prox: proximal anchoring + least squares (eps = rho)\n"
+               "nan = solve failed"
     )
 
 
