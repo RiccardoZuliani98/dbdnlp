@@ -601,6 +601,9 @@ class DifferentiableNLP:
             - "active_set": Identifies active inequalities and solves a reduced, 
                             symmetric KKT system. options['lstsq']=True returns
                             the minimum-norm least-squares solution instead.
+                            options['prox']=eps adds eps * I to the Hessian, i.e.
+                            differentiates the problem with the proximal term
+                            (eps/2) ||x - x_bar||^2 added to the cost.
             - "regularized": Previous regularization (rho_1 * I, rho_2 * I).
             - "projected": Current regularization (rho_1 * Pi_P, rho_2 * Pi_U),
                            see `degenerate_subspaces`. Options: rho_1, rho_2,
@@ -682,8 +685,8 @@ class DifferentiableNLP:
             M = np.zeros((N_act, N_act))
             N_rhs = np.zeros((N_act, n_theta))
 
-            # Block 1: Stationarity
-            M[:n_x, :n_x] = H_xx_np
+            # Block 1: Stationarity (with optional proximal term eps * I)
+            M[:n_x, :n_x] = H_xx_np + opts.get("prox", 0.0) * np.eye(n_x)
             N_rhs[:n_x, :] = H_xtheta_np
 
             # Block 2: Active Inequalities
