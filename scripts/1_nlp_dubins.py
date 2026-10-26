@@ -613,6 +613,7 @@ if __name__ == "__main__":
     # even on the degenerate directions) and `warm` (plain warm-started FD on
     # the original problem, itself just one method among the ones being judged).
     print("\n--- 3. dx/dm against the closest-point reference")
+    print(f"    |dx/dm| (FD): {np.linalg.norm(np.array(ref)):.3e} (proximal), {np.linalg.norm(np.array(warm)):.3e} (warm-started)")
     print(f"    {'method':<26} {'err vs ref':>10} {'err vs warm':>12}")
 
     err_rows = []                  # (method, rho, err vs proximal FD, err vs warm-started FD)
