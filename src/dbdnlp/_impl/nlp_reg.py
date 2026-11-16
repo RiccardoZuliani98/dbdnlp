@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Automatic Control Laboratory, ETH Zurich, 8092 Zurich, Switzerland
+# Copyright (c) 2026 Automatic Control Laboratory, ETH Zurich, 8092 Zurich, Switzerland, Riccardo Zuliani
 # SPDX-License-Identifier: MIT
 # Licensed under the MIT License. See the LICENSE file in the project root.
 
