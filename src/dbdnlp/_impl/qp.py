@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Automatic Control Laboratory, ETH Zurich, 8092 Zurich, Switzerland
+# SPDX-License-Identifier: MIT
+# Licensed under the MIT License. See the LICENSE file in the project root.
+
 import casadi as ca
 import numpy as np
 from dataclasses import dataclass

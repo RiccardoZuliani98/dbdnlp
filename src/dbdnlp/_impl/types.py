@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Automatic Control Laboratory, ETH Zurich, 8092 Zurich, Switzerland
+# SPDX-License-Identifier: MIT
+# Licensed under the MIT License. See the LICENSE file in the project root.
+
 from dataclasses import dataclass
 from typing import (
     Dict, Optional, Callable, Union, 
