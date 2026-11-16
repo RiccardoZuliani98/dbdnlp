@@ -1,6 +1,6 @@
 # Copyright (c) 2026 ETH Zurich, Riccardo Zuliani
-# SPDX-License-Identifier: MIT
-# Licensed under the MIT License. See the LICENSE file in the project root.
+# SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0. See the LICENSE file in the project root.
 
 from dataclasses import dataclass
 from typing import (
