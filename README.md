@@ -47,7 +47,6 @@ print(d["x"])  # dx/dθ, shape (n_x, n_theta)
 
 - **`DifferentiableNLP`** ([src/dbdnlp/_impl/nlp.py](src/dbdnlp/_impl/nlp.py)) builds the CasADi solver (IPOPT by default; set `solver_opts["plugin"]` to use another) and compiles the KKT and derivative functions once, at construction.
   - `solve(theta, ...)` solves the NLP, with optional warm starts, and returns an `NLPSolution` that includes the KKT residuals.
-  - `evaluate(theta, x, lam, nu)` wraps any primal-dual point as an `NLPSolution` without solving.
   - `differentiate(theta, x, lam, nu, mode, options)` computes the sensitivities. It has four modes:
     - `"full"` differentiates the full KKT system.
     - `"active_set"` solves the reduced symmetric KKT system on the active constraints. Options: `lstsq` (least-squares solution) and `prox` (adds a proximal term).
